@@ -15,6 +15,7 @@ class TensorWriter:
         self,
         sparse=False,
         exponential_transform=False,
+        systematic_type = "log_normal",
         allow_negative_expectation=False,
     ):
         self.allow_negative_expectation = allow_negative_expectation
@@ -22,6 +23,8 @@ class TensorWriter:
         self.exponential_transform_scale = (
             100000  # multiplier for the exponential transformed tensor
         )
+
+        self.systematic_type = systematic_type
 
         self.symmetric_tensor = True  # If all shape systematics are symmetrized the systematic tensor is symmetric leading to reduced memory and improved efficiency
         self.add_bin_by_bin_stat_to_data_cov = False  # add bin by bin statistical uncertainty to data covariance matrix in case covariance is given for chi2
@@ -277,23 +280,31 @@ class TensorWriter:
                 f"{len(syst)-sum(np.isfinite(syst))} NaN or Inf values encountered in systematic!"
             )
 
-        # check if there is a sign flip between systematic and nominal
-        if self.exponential_transform:
-            _logk = kfac * (syst - norm) / self.exponential_transform_scale
-        else:
-            _logk = kfac * np.log(syst / norm)
-        _logk_view = np.where(
-            np.equal(np.sign(norm * syst), 1),
-            _logk,
-            self.logkepsilon * np.ones_like(_logk),
-        )
+        # TODO clean this up and avoid duplication
+        if self.systematic_type == "log_normal":
+            # check if there is a sign flip between systematic and nominal
+            if self.exponential_transform:
+                _logk = kfac * (syst - norm) / self.exponential_transform_scale
+            else:
+                _logk = kfac * np.log(syst / norm)
+            _logk_view = np.where(
+                np.equal(np.sign(norm * syst), 1),
+                _logk,
+                self.logkepsilon * np.ones_like(_logk),
+            )
 
-        if self.clipSystVariations > 0.0:
-            _logk = np.clip(_logk, -self.clip, self.clip)
-        if self.exponential_transform:
+            #FIXME does this actually take effect since _logk_view is normally returned?
+            if self.clipSystVariations > 0.0:
+                _logk = np.clip(_logk, -self.clip, self.clip)
+            if self.exponential_transform:
+                return _logk
+            else:
+                return _logk_view
+        elif self.systematic_type == "normal":
+            _logk = kfac*(syst - norm)
             return _logk
         else:
-            return _logk_view
+            raise RuntimeError(f"Invalid systematic_type {self.indata.systematic_type}, valid choices are 'log_normal' or 'normal'")
 
     def book_logk_avg(self, *args):
         self.book_logk(
@@ -650,6 +661,7 @@ class TensorWriter:
             "symmetric_tensor": self.symmetric_tensor,
             "exponential_transform": self.exponential_transform,
             "exponential_transform_scale": self.exponential_transform_scale,
+            "systematic_type" : self.systematic_type,
         }
 
         ioutils.pickle_dump_h5py("meta", meta, f)
