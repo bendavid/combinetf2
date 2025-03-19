@@ -105,6 +105,9 @@ class Fitter:
         # parameter covariance matrix
         self.cov = tf.Variable(self.prefit_covariance(), trainable=False, name="cov")
 
+        # determine if problem is linear (ie likelihood is purely quadratic)
+        self.is_linear = self.chisqFit and self.indata.symmetric_tensor and self.indata.systematic_type == "normal" and self.npoi == 0
+
     def prefit_covariance(self, unconstrained_err=0.0):
         # free parameters are taken to have zero uncertainty for the purposes of prefit uncertainties
         var_poi = tf.zeros([self.npoi], dtype=self.indata.dtype)
@@ -1127,32 +1130,42 @@ class Fitter:
 
     def minimize(self):
 
-        def scipy_loss(xval):
+        if self.is_linear:
+            print("linear solve")
+
+            # no need to do a minimization, simple matrix solve is sufficient
+            val, grad, hess = self.loss_val_grad_hess()
+
+            # use a Cholesky decomposition to easily detect the non-positive-definite case
+            chol = tf.linalg.cholesky(hess)
+            del hess
+            gradv = grad[..., None]
+            dx =  tf.linalg.cholesky_solve(chol, -gradv)[:, 0]
+            del chol
+
+            self.x.assign_add(dx)
+        else:
+            def scipy_loss(xval):
+                self.x.assign(xval)
+                val, grad = self.loss_val_grad()
+                return val.__array__(), grad.__array__()
+
+            def scipy_hessp(xval, pval):
+                self.x.assign(xval)
+                p = tf.convert_to_tensor(pval)
+                val, grad, hessp = self.loss_val_grad_hessp(p)
+                return hessp.__array__()
+
+            xval = self.x.numpy()
+
+            res = scipy.optimize.minimize(
+                scipy_loss, xval, method="trust-krylov", jac=True, hessp=scipy_hessp, tol=0.,
+            )
+
+            xval = res["x"]
+
             self.x.assign(xval)
-            val, grad = self.loss_val_grad()
-            # print("scipy_loss", val)
-            return val.numpy(), grad.numpy()
-
-        def scipy_hessp(xval, pval):
-            self.x.assign(xval)
-            p = tf.convert_to_tensor(pval)
-            val, grad, hessp = self.loss_val_grad_hessp(p)
-            # print("scipy_hessp", val)
-            return hessp.numpy()
-
-        xval = self.x.numpy()
-
-        res = scipy.optimize.minimize(
-            scipy_loss, xval, method="trust-krylov", jac=True, hessp=scipy_hessp
-        )
-
-        xval = res["x"]
-
-        self.x.assign(xval)
-
-        print(res)
-
-        return res
+            print(res)
 
     def nll_scan(self, param, scan_range, scan_points, use_prefit=False):
         # make a likelihood scan for a single parameter
