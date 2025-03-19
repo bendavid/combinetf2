@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
+import tensorflow as tf
+tf.config.experimental.enable_op_determinism()
+
 import argparse
 import time
 
 import h5py
 import numpy as np
-import tensorflow as tf
+
 
 from combinetf2 import fitter, inputdata, io_tools, workspace
 

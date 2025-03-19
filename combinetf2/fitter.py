@@ -1025,8 +1025,11 @@ class Fitter:
 
         return val, grad
 
+    # FIXME in principle this version of the function is preferred
+    # but seems to introduce some small numerical non-reproducibility
     @tf.function
-    def loss_val_grad_hessp(self, p):
+    def loss_val_grad_hessp_fwdrev(self, p):
+        p = tf.stop_gradient(p)
         with tf.autodiff.ForwardAccumulator(self.x, p) as acc:
             with tf.GradientTape() as grad_tape:
                 val = self._compute_loss()
@@ -1034,6 +1037,19 @@ class Fitter:
         hessp = acc.jvp(grad)
 
         return val, grad, hessp
+
+    @tf.function
+    def loss_val_grad_hessp_revrev(self, p):
+        p = tf.stop_gradient(p)
+        with tf.GradientTape() as t2:
+            with tf.GradientTape() as t1:
+                val = self._compute_loss()
+            grad = t1.gradient(val, self.x)
+        hessp = t2.gradient(grad, self.x, output_gradients=p)
+
+        return val, grad, hessp
+
+    loss_val_grad_hessp = loss_val_grad_hessp_revrev
 
     @tf.function
     def loss_val_grad_hess(self, profile_grad=True):
