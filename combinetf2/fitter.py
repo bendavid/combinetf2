@@ -177,14 +177,16 @@ class Fitter:
             # TODO properly implement randomization of constraint parameters associated with bin-by-bin stat nuisances for frequentist toys,
             # currently bin-by-bin stat fluctuations are always handled in a bayesian way in toys
             # this also means bin-by-bin stat fluctuations are not consistently propagated for bootstrap toys from data
-            self.beta0.assign(
-                tf.random.gamma(
-                    shape=[],
-                    alpha=self.indata.kstat + 1.0,
-                    beta=self.indata.kstat,
-                    dtype=self.beta0.dtype,
-                )
-            )
+            raise NotImplementedError("binByBinStat not currently supported for toys")
+
+            # self.beta0.assign(
+            #     tf.random.gamma(
+            #         shape=[],
+            #         alpha=self.indata.kstat + 1.0,
+            #         beta=self.indata.kstat,
+            #         dtype=self.beta0.dtype,
+            #     )
+            # )
 
         if bootstrap_data:
             # randomize from observed data
