@@ -1226,7 +1226,7 @@ class Fitter:
 
         return val, valfull, grad, hess
 
-    def minimize(self):
+    def minimize(self, exact=False):
 
         if self.is_linear:
             logger.info(
@@ -1253,10 +1253,15 @@ class Fitter:
             self.x.assign_add(dx)
         else:
 
-            def scipy_loss(xval):
+            def scipy_loss_grad(xval):
                 self.x.assign(xval)
                 val, grad = self.loss_val_grad()
                 return val.__array__(), grad.__array__()
+
+            def scipy_hess(xval):
+                self.x.assign(xval)
+                val, grad, hess = self.loss_val_grad_hess()
+                return hess.__array__()
 
             def scipy_hessp(xval, pval):
                 self.x.assign(xval)
@@ -1268,15 +1273,26 @@ class Fitter:
             callback = FitterCallback(xval)
 
             try:
-                res = scipy.optimize.minimize(
-                    scipy_loss,
-                    xval,
-                    method="trust-krylov",
-                    jac=True,
-                    hessp=scipy_hessp,
-                    tol=0.0,
-                    callback=callback,
-                )
+                if exact:
+                    res = scipy.optimize.minimize(
+                        scipy_loss_grad,
+                        xval,
+                        method="trust-exact",
+                        jac=True,
+                        hess=scipy_hess,
+                        tol=0.0,
+                        callback=callback,
+                    )
+                else:
+                    res = scipy.optimize.minimize(
+                        scipy_loss_grad,
+                        xval,
+                        method="trust-krylov",
+                        jac=True,
+                        hessp=scipy_hessp,
+                        tol=0.0,
+                        callback=callback,
+                    )
             except Exception as ex:
                 # minimizer could have called the loss or hessp functions with "random" values, so restore the
                 # state from the end of the last iteration before the exception
