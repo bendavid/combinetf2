@@ -402,6 +402,224 @@ def fit(args, fitter, ws, dofit=True):
 
         # compute the covariance matrix and estimated distance to minimum
 
+        benchmark = True
+
+        if benchmark:
+            import scipy
+
+            # make sure these are pre-jitted
+            fitter.loss_val()
+            val, grad = fitter.loss_val_grad()
+            fitter.loss_val_grad_hessp(grad)
+            fitter.loss_val_grad_hess()
+
+            start = time.time()
+            fitter.loss_val()
+            stop = time.time()
+            print("val", stop - start)
+
+            start = time.time()
+            (
+                val,
+                grad,
+            ) = fitter.loss_val_grad()
+            stop = time.time()
+            print("val_grad", stop - start)
+
+            start = time.time()
+            val, grad, hessp = fitter.loss_val_grad_hessp(grad)
+            stop = time.time()
+            print("val_grad_hessp", stop - start)
+
+            start = time.time()
+            val, grad, hess = fitter.loss_val_grad_hess()
+            stop = time.time()
+            print("val_grad_hess", stop - start)
+
+            n = hess.shape[0]
+
+            # start = time.time()
+            # for i in range(n):
+            #     val, grad, hessp = fitter.loss_val_grad_hessp(grad)
+            # stop = time.time()
+            # print("val_grad_hessp n", stop-start)
+
+            def op_hessp(pval):
+                pval = pval.ravel().astype(np.float64)
+                p = tf.convert_to_tensor(pval)
+                val, grad, hessp = fitter.loss_val_grad_hessp(p)
+                return hessp.__array__()
+
+            hessp_op = scipy.sparse.linalg.LinearOperator(hess.shape, matvec=op_hessp)
+
+            start = time.time()
+            cov = tf.linalg.inv(hess)
+            stop = time.time()
+            print("tf inv", stop - start)
+
+            start = time.time()
+            cov = np.linalg.inv(hess)
+            stop = time.time()
+            print("np inv", stop - start)
+
+            start = time.time()
+            chol = tf.linalg.cholesky(hess)
+            stop = time.time()
+            print("tf chol", stop - start)
+
+            start = time.time()
+            cov = tf.linalg.cholesky_solve(
+                chol, tf.eye(chol.shape[0], dtype=chol.dtype)
+            )
+            stop = time.time()
+            print("tf chol inv", stop - start)
+
+            start = time.time()
+            chol = scipy.linalg.cho_factor(hess)
+            stop = time.time()
+            print("scipy chol", stop - start)
+
+            start = time.time()
+            cov = scipy.linalg.cho_solve(
+                chol, np.eye(hess.shape[0], dtype=val.__array__().dtype)
+            )
+            stop = time.time()
+            print("scipy chol inv", stop - start)
+            print(cov)
+
+            from scipy.linalg.lapack import dtrtri
+
+            start = time.time()
+            u, lower = chol
+            uinv, _ = dtrtri(u, lower=lower)
+            uinv = np.triu(uinv)
+            cov = uinv @ uinv.T
+            stop = time.time()
+            print("scipy dtrtri inv", stop - start)
+            print(cov)
+
+            from scipy.linalg.lapack import dtrtri
+
+            start = time.time()
+            u, lower = chol
+            uinv, _ = scipy.linalg.lapack.dpotri(u, lower=lower)
+            uinv = np.triu(uinv)
+            cov = uinv @ uinv.T
+            stop = time.time()
+            print("scipy dpotri inv", stop - start)
+            print(cov)
+
+            start = time.time()
+            e, v = scipy.sparse.linalg.lobpcg(
+                hess.__array__(), np.ones((n, 1), dtype=np.float64), largest=True
+            )
+            stop = time.time()
+            print("scipy lobpcg largest", stop - start, e)
+
+            start = time.time()
+            e, v = scipy.sparse.linalg.lobpcg(
+                hessp_op, np.ones((n, 1), dtype=np.float64), largest=True
+            )
+            stop = time.time()
+            print("scipy lobpcg largest implicit", stop - start, e)
+
+            start = time.time()
+            e, v = scipy.sparse.linalg.lobpcg(
+                hess.__array__(),
+                np.ones((n, 1), dtype=np.float64),
+                largest=False,
+                maxiter=1000,
+            )
+            stop = time.time()
+            print("scipy lobpcg smallest", stop - start, e)
+
+            start = time.time()
+            e, v = scipy.sparse.linalg.lobpcg(
+                hessp_op, np.ones((n, 1), dtype=np.float64), largest=False, maxiter=1000
+            )
+            stop = time.time()
+            print("scipy lobpcg smallest implicit", stop - start, e)
+
+            start = time.time()
+            e = scipy.linalg.eigvalsh(hess, subset_by_index=[0, 0])
+            stop = time.time()
+            print("scipy smallest eigval", stop - start, e)
+
+            start = time.time()
+            e = scipy.linalg.eigvalsh(hess, subset_by_index=[0, 0], driver="evx")
+            stop = time.time()
+            print("scipy smallest eigval evx", stop - start, e)
+
+            start = time.time()
+            e = scipy.linalg.eigvalsh(hess, subset_by_index=[n - 1, n - 1])
+            stop = time.time()
+            print("scipy largest eigval", stop - start, e)
+
+            start = time.time()
+            e = scipy.linalg.eigvalsh(
+                hess, subset_by_index=[n - 1, n - 1], driver="evx"
+            )
+            stop = time.time()
+            print("scipy largest eigval evx", stop - start, e)
+
+            start = time.time()
+            e = scipy.linalg.eigvalsh(hess, subset_by_value=[-np.inf, 0.0])
+            stop = time.time()
+            print("scipy negative eigvals", stop - start, e)
+
+            start = time.time()
+            e = scipy.linalg.eigvalsh(
+                hess, subset_by_value=[-np.inf, 0.0], driver="evx"
+            )
+            stop = time.time()
+            print("scipy negative eigvals evx", stop - start, e)
+
+            start = time.time()
+            e = scipy.linalg.eigvalsh(hess)
+            stop = time.time()
+            print("scipy eigvals", stop - start, e)
+
+            start = time.time()
+            e = tf.linalg.eigvalsh(hess)
+            stop = time.time()
+            print("tf eigvals", stop - start, e)
+
+            start = time.time()
+            e = scipy.sparse.linalg.eigsh(
+                hess.__array__(), k=1, return_eigenvectors=False
+            )
+            stop = time.time()
+            print("scipy sparse eigvals LM", stop - start, e)
+
+            start = time.time()
+            e = scipy.sparse.linalg.eigsh(
+                hess.__array__(), k=1, which="LA", return_eigenvectors=False
+            )
+            stop = time.time()
+            print("scipy sparse eigvals LA", stop - start, e)
+
+            start = time.time()
+            e = scipy.sparse.linalg.eigsh(
+                hessp_op, k=1, which="LM", return_eigenvectors=False
+            )
+            stop = time.time()
+            print("scipy sparse eigvals LM implicit", stop - start, e)
+
+            # start = time.time()
+            # e = scipy.sparse.linalg.eigsh(hess.__array__(), k=1, which="SA", return_eigenvectors=False)
+            # stop = time.time()
+            # print("scipy sparse eigvals SA", stop-start, e)
+
+            # start = time.time()
+            # e = scipy.sparse.linalg.eigsh(hess.__array__(), k=1, which="LM", sigma=0., return_eigenvectors=False)
+            # stop = time.time()
+            # print("scipy sparse eigvals LM shifted", stop-start, e)
+
+            # start = time.time()
+            # e = scipy.sparse.linalg.eigsh(hess.__array__(), k=1, which="LA", sigma=-1., return_eigenvectors=False)
+            # stop = time.time()
+            # print("scipy sparse eigvals LA inverted", stop-start, e)
+
         val, grad, hess = fitter.loss_val_grad_hess()
 
         # use a Cholesky decomposition to easily detect the non-positive-definite case

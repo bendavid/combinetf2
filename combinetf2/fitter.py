@@ -6,6 +6,9 @@ from wums import logging
 
 from combinetf2.tfhelpers import is_diag, simple_sparse_slice0end
 
+from ._trustregion_exact import _minimize_trustregion_exact
+from ._trustregion_krylov import _minimize_trust_krylov
+
 logger = logging.child_logger(__name__)
 
 
@@ -1274,26 +1277,55 @@ class Fitter:
 
             try:
                 if exact:
+                    # res = scipy.optimize.minimize(
+                    #     scipy_loss_grad,
+                    #     xval,
+                    #     method="trust-exact",
+                    #     jac=True,
+                    #     hess=scipy_hess,
+                    #     tol=-1.,
+                    #     callback=callback,
+                    #     options = { "disp" : True }
+                    # )
                     res = scipy.optimize.minimize(
                         scipy_loss_grad,
                         xval,
-                        method="trust-exact",
+                        method=_minimize_trustregion_exact,
                         jac=True,
                         hess=scipy_hess,
-                        tol=0.0,
+                        tol=-1.0,
                         callback=callback,
+                        options={"disp": True, "gtol": -1.0},
                     )
                 else:
+                    # np.seterr(all="raise")
+                    # res = scipy.optimize.minimize(
+                    #     scipy_loss_grad,
+                    #     xval,
+                    #     method="trust-krylov",
+                    #     jac=True,
+                    #     hessp=scipy_hessp,
+                    #     # tol=0.0,
+                    #     tol=-1.,
+                    #     callback=callback,
+                    #     # options = { "disp" : True, "inexact" : True }
+                    #     options = { "disp" : True}
+                    # )
+
                     res = scipy.optimize.minimize(
                         scipy_loss_grad,
                         xval,
-                        method="trust-krylov",
+                        method=_minimize_trust_krylov,
                         jac=True,
                         hessp=scipy_hessp,
-                        tol=0.0,
+                        # tol=0.0,
+                        tol=-1.0,
                         callback=callback,
+                        options={"disp": True, "inexact": True, "gtol": -1.0},
+                        # options = { "disp" : True}
                     )
             except Exception as ex:
+                raise ex
                 # minimizer could have called the loss or hessp functions with "random" values, so restore the
                 # state from the end of the last iteration before the exception
                 xval = callback.xval
