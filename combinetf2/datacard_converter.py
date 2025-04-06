@@ -162,6 +162,8 @@ class DatacardConverter:
         if self.use_root:
             root_file = self.get_root_file(file_path)
             histogram = root_file.Get(hist_name)
+            if hasattr(histogram, "SetDirectory"):
+                histogram.SetDirectory(0)
         else:
             # Try to find the histogram in the file
             histogram = self.root_directories[file_path]
