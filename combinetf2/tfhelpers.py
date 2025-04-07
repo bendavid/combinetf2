@@ -1,6 +1,6 @@
 import tensorflow as tf
 
-from .scipyhelpers import scipy_edmval_cov
+from .scipyhelpers import scipy_compute_preconditioner, scipy_edmval_cov
 
 
 def simple_sparse_slice0end(in_sparse, end):
@@ -64,9 +64,31 @@ def tf_edmval_cov(grad, hess):
     return edmval, cov
 
 
+def tf_compute_preconditioner(hess):
+    L = tf.linalg.cholesky(hess)
+    U = tf.transpose(L)
+    del L
+    Uinv = tf.linalg.triangular_solve(
+        U, tf.eye(hess.shape[0], dtype=hess.dtype), lower=False
+    )
+
+    m_precond = Uinv
+    m_precond_inv = U
+
+    return m_precond, m_precond_inv
+
+
 def edmval_cov(grad, hess):
     # scipy is faster than tensorflow on CPU so use it as appropriate
     if is_on_gpu(hess):
         return tf_edmval_cov(grad, hess)
     else:
         return scipy_edmval_cov(grad, hess)
+
+
+def compute_preconditioner(hess, overwrite_a=False):
+    # scipy is faster than tensorflow on CPU so use it as appropriate
+    if is_on_gpu(hess):
+        return tf_compute_preconditioner(hess)
+    else:
+        return scipy_compute_preconditioner(hess, overwrite_a=overwrite_a)

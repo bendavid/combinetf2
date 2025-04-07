@@ -4,19 +4,26 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 from wums import logging
 
-from combinetf2.tfhelpers import is_diag, simple_sparse_slice0end
+from combinetf2.scipyhelpers import (
+    minimize_methods,
+    minimize_methods_hess,
+    minimize_methods_hessp,
+)
+from combinetf2.tfhelpers import (
+    compute_preconditioner,
+    is_diag,
+    simple_sparse_slice0end,
+)
 
 logger = logging.child_logger(__name__)
 
 
 class FitterCallback:
-    def __init__(self, xv):
+    def __init__(self):
         self.iiter = 0
-        self.xval = xv
 
     def __call__(self, intermediate_result):
         logger.debug(f"Iteration {self.iiter}: loss value {intermediate_result.fun}")
-        self.xval = intermediate_result.x
         self.iiter += 1
 
 
@@ -24,6 +31,8 @@ class Fitter:
     def __init__(self, indata, options):
         self.indata = indata
         self.binByBinStat = not options.noBinByBinStat
+        self.minimizerMethod = options.minimizerMethod
+        self.minimizerTolerance = options.minimizerTolerance
         self.systgroupsfull = self.indata.systgroups.tolist()
         self.systgroupsfull.append("stat")
         if self.binByBinStat:
@@ -57,6 +66,11 @@ class Fitter:
                 f"Invalid systematic_type {self.indata.systematic_type}, valid choices are 'log_normal' or 'normal'"
             )
 
+        if self.minimizerMethod not in minimize_methods:
+            raise RuntimeError(
+                f"Invalid minimize method {self.minimize_method}, valid choices are {', '.join(minimize_methods)}."
+            )
+
         self.chisqFit = options.chisqFit
         self.externalCovariance = options.externalCovariance
         self.prefitUnconstrainedNuisanceUncertainty = (
@@ -79,6 +93,19 @@ class Fitter:
             poidefault = tf.zeros([], dtype=self.indata.dtype)
         else:
             raise Exception("unsupported POIMode")
+
+        # determine if problem is linear (ie likelihood is purely quadratic)
+        self.is_linear = (
+            self.chisqFit
+            and self.indata.symmetric_tensor
+            and self.indata.systematic_type == "normal"
+            and self.npoi == 0
+            and ((not self.binByBinStat) or self.binByBinStatType == "normal")
+        )
+
+        # preconditioning is pointless if the likelihood is purely quadratic, since it can be
+        # solved directly/exactly/efficiently in this case regardless
+        self.preconditioning = not self.is_linear and not options.noPreconditioning
 
         self.parms = np.concatenate([self.pois, self.indata.systs])
 
@@ -149,9 +176,30 @@ class Fitter:
                     )
                 )
 
+        if self.preconditioning:
+            self.m_precond = tf.Variable(
+                tf.eye(self.x.shape[0], dtype=self.x.dtype), trainable=False
+            )
+            self.m_precond_inv = tf.Variable(self.m_precond, trainable=False)
+            self.offset_precond = tf.Variable(tf.zeros_like(self.x), trainable=False)
+
         self.nexpnom = tf.Variable(
             self.expected_yield(), trainable=False, name="nexpnom"
         )
+
+        if self.preconditioning:
+            self.nobs.assign(self.nexpnom)
+            val, grad, hess = self.loss_val_grad_hess()
+
+            m_precond, m_precond_inv = compute_preconditioner(hess, overwrite_a=True)
+            self.m_precond.assign(m_precond)
+            del m_precond
+            self.m_precond_inv.assign(m_precond_inv)
+            del m_precond_inv
+
+            self.offset_precond.assign(self.x)
+            self.x.assign(tf.zeros_like(self.x))
+            self.nobs.assign(self.indata.data_obs)
 
         # parameter covariance matrix
         self.cov = tf.Variable(
@@ -160,15 +208,6 @@ class Fitter:
             ),
             trainable=False,
             name="cov",
-        )
-
-        # determine if problem is linear (ie likelihood is purely quadratic)
-        self.is_linear = (
-            self.chisqFit
-            and self.indata.symmetric_tensor
-            and self.indata.systematic_type == "normal"
-            and self.npoi == 0
-            and ((not self.binByBinStat) or self.binByBinStatType == "normal")
         )
 
     def _default_beta0(self):
@@ -200,14 +239,23 @@ class Fitter:
 
         return val, jac
 
+    def assign_x(self, xval):
+        if self.preconditioning:
+            xp = self.m_precond_inv @ (xval[:, None] - self.offset_precond[:, None])
+            xp = xp[:, 0]
+        else:
+            xp = xval
+
+        self.x.assign(xp)
+
     def theta0defaultassign(self):
         self.theta0.assign(tf.zeros([self.indata.nsyst], dtype=self.theta0.dtype))
 
     def xdefaultassign(self):
         if self.npoi == 0:
-            self.x.assign(self.theta0)
+            self.assign_x(self.theta0)
         else:
-            self.x.assign(tf.concat([self.xpoidefault, self.theta0], axis=0))
+            self.assign_x(tf.concat([self.xpoidefault, self.theta0], axis=0))
 
     def beta0defaultassign(self):
         self.beta0.assign(self._default_beta0())
@@ -230,12 +278,12 @@ class Fitter:
     def bayesassign(self):
         # FIXME use theta0 as the mean and constraintweight to scale the width
         if self.npoi == 0:
-            self.x.assign(
+            self.assign_x(
                 self.theta0
                 + tf.random.normal(shape=self.theta0.shape, dtype=self.theta0.dtype)
             )
         else:
-            self.x.assign(
+            self.assign_x(
                 tf.concat(
                     [
                         self.xpoidefault,
@@ -354,7 +402,7 @@ class Fitter:
             # for unconstrained nuisances for example) since the multivariate normal distribution
             # requires a positive-definite covariance matrix
             if is_diag(self.cov):
-                self.x.assign(
+                self.assign_x(
                     tf.random.normal(
                         shape=[],
                         mean=self.x,
@@ -366,7 +414,7 @@ class Fitter:
                 pparms = tfp.distributions.MultivariateNormalTriL(
                     loc=self.x, scale_tril=tf.linalg.cholesky(self.cov)
                 )
-                self.x.assign(pparms.sample())
+                self.assign_x(pparms.sample())
             if self.binByBinStat:
                 self.beta.assign(
                     tf.random.normal(
@@ -742,16 +790,30 @@ class Fitter:
 
         return expvars
 
-    def _compute_yields_noBBB(self, compute_norm=False, full=True):
-        # compute_norm: compute yields for each process, otherwise inclusive
-        # full: compute yields inclduing masked channels
-        xpoi = self.x[: self.npoi]
-        theta = self.x[self.npoi :]
+    def _compute_poi_theta(self):
+        xt = self.x
+
+        if self.preconditioning:
+            # note that in principle this could be done with triangular_solve
+            # to avoid the initial explicit inversion but in practice this is much
+            # slower than the matrix multiplication
+            xt = (self.m_precond @ xt[:, None])[:, 0] + self.offset_precond
+
+        xpoi = xt[: self.npoi]
+        theta = xt[self.npoi :]
 
         if self.allowNegativePOI:
             poi = xpoi
         else:
             poi = tf.square(xpoi)
+
+        return poi, theta
+
+    def _compute_yields_noBBB(self, compute_norm=False, full=True):
+        # compute_norm: compute yields for each process, otherwise inclusive
+        # full: compute yields inclduing masked channels
+
+        poi, theta = self._compute_poi_theta()
 
         rnorm = tf.concat(
             [poi, tf.ones([self.indata.nproc - poi.shape[0]], dtype=self.indata.dtype)],
@@ -841,10 +903,10 @@ class Fitter:
         else:
             normcentral = None
 
-        return nexpcentral, normcentral
+        return nexpcentral, normcentral, theta
 
     def _compute_yields_with_beta(self, profile=True, compute_norm=False, full=True):
-        nexp, norm = self._compute_yields_noBBB(compute_norm, full=full)
+        nexp, norm, theta = self._compute_yields_noBBB(compute_norm, full=full)
 
         if self.binByBinStat:
             if profile:
@@ -909,11 +971,11 @@ class Fitter:
         else:
             beta = None
 
-        return nexp, norm, beta
+        return nexp, norm, beta, theta
 
     @tf.function
     def _profile_beta(self):
-        nexp, norm, beta = self._compute_yields_with_beta()
+        nexp, norm, beta, theta = self._compute_yields_with_beta()
         self.beta.assign(beta)
 
     @tf.function
@@ -931,7 +993,7 @@ class Fitter:
         return nexpfullcentral
 
     def _compute_yields(self, inclusive=True, profile=True, full=True):
-        nexpcentral, normcentral, beta = self._compute_yields_with_beta(
+        nexpcentral, normcentral, beta, theta = self._compute_yields_with_beta(
             profile=profile,
             compute_norm=not inclusive,
             full=full,
@@ -1045,7 +1107,7 @@ class Fitter:
 
     @tf.function
     def _expected_yield_noBBB(self, full=False):
-        res, _ = self._compute_yields_noBBB(full=full)
+        res, _, _ = self._compute_yields_noBBB(full=full)
         return res
 
     @tf.function
@@ -1094,9 +1156,9 @@ class Fitter:
         return l
 
     def _compute_nll(self, profile=True):
-        theta = self.x[self.npoi :]
+        # theta = self.x[self.npoi :]
 
-        nexpfullcentral, _, beta = self._compute_yields_with_beta(
+        nexpfullcentral, _, beta, theta = self._compute_yields_with_beta(
             profile=profile,
             compute_norm=False,
             full=False,
@@ -1271,28 +1333,44 @@ class Fitter:
                 val, grad, hessp = self.loss_val_grad_hessp(p)
                 return hessp.__array__()
 
-            xval = self.x.numpy()
-            callback = FitterCallback(xval)
+            def scipy_hess(xval):
+                self.x.assign(xval)
+                val, grad, hess = self.loss_val_grad_hess()
+                return hess.__array__()
 
-            try:
-                res = scipy.optimize.minimize(
-                    scipy_loss,
-                    xval,
-                    method="trust-krylov",
-                    jac=True,
-                    hessp=scipy_hessp,
-                    tol=0.0,
-                    callback=callback,
-                )
-            except Exception as ex:
-                # minimizer could have called the loss or hessp functions with "random" values, so restore the
-                # state from the end of the last iteration before the exception
-                xval = callback.xval
-                logger.debug(ex)
-            else:
-                xval = res["x"]
-                logger.debug(res)
+            xval = self.x.__array__()
+            callback = FitterCallback()
 
+            hess = None
+            hessp = None
+
+            # provide the minimizer hessian-vector products if supported, otherwise the hessian directly
+            if self.minimizerMethod in minimize_methods_hessp:
+                hessp = scipy_hessp
+            elif self.minimizerMethod in minimize_methods_hess:
+                hess = scipy_hess
+
+            print("hess", hess)
+            print("hessp", hessp)
+
+            logger.debug(
+                f"calling scipy.optimize.minimize with method={self.minimizerMethod} and tol={self.minimizerTolerance}."
+            )
+
+            # no exception handling here since minimizers should catch e.g. linear algebra errors internally
+            # and terminate
+            res = scipy.optimize.minimize(
+                scipy_loss,
+                xval,
+                method=self.minimizerMethod,
+                jac=True,
+                hess=hess,
+                hessp=hessp,
+                tol=self.minimizerTolerance,
+                callback=callback,
+            )
+
+            xval = res["x"]
             self.x.assign(xval)
 
         # force profiling of beta with final parameter values

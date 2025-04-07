@@ -12,6 +12,7 @@ import numpy as np
 
 from combinetf2 import fitter, inputdata, io_tools, workspace
 from combinetf2.physicsmodels import helpers as ph
+from combinetf2.scipyhelpers import minimize_methods
 from combinetf2.tfhelpers import edmval_cov
 
 from wums import output_tools, logging  # isort: skip
@@ -269,6 +270,24 @@ def make_parser():
         type=float,
         help="Assumed prefit uncertainty for unconstrained nuisances",
     )
+    parser.add_argument(
+        "--noPreconditioning",
+        default=False,
+        action="store_true",
+        help="Don't use preconditioning to speed up and improve robustness of minimization",
+    )
+    parser.add_argument(
+        "--minimizerMethod",
+        default="trust-krylov",
+        choices=minimize_methods,
+        help=f"Minimization method to use for the fit.  Valid options (for scipy.optimize.minimize) are {', '.join(minimize_methods)}",
+    )
+    parser.add_argument(
+        "--minimizerTolerance",
+        type=float,
+        # default=None,
+        help="Minimizer tolerance (default chosen automatically).  For the default trust-krylov minimizer with preconditioning, the default tolerance is 1e-4. The corresponding approximate upper bound on the estimated distance to minimum (edmval) is 0.5*tolerance^2 (5e-9 by default).",
+    )
 
     return parser.parse_args()
 
@@ -423,6 +442,8 @@ def fit(args, fitter, ws, dofit=True):
 
     nllvalfull = fitter.full_nll().numpy()
     satnllvalfull, ndfsat = fitter.saturated_nll()
+
+    logger.debug(f"nllvalfull {nllvalfull}")
 
     satnllvalfull = satnllvalfull.numpy()
     ndfsat = ndfsat.numpy()
