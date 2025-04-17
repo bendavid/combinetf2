@@ -98,3 +98,16 @@ def scipy_compute_preconditioner(hess, overwrite_a=False):
     m_precond_inv = U
 
     return m_precond, m_precond_inv
+
+
+def is_diag(x):
+    return np.count_nonzero(x) == np.count_nonzero(np.diag(x))
+
+
+def cholesky_adaptive(a, lower=False, overwrite_a=False, check_finite=True):
+    if is_diag(a):
+        return np.sqrt(a)
+    else:
+        return scipy.linalg.cholesky(
+            lower=lower, overwrite_a=overwrite_a, check_finite=check_finite
+        )

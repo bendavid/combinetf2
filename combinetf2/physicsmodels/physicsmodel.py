@@ -1,3 +1,4 @@
+import hist
 import tensorflow as tf
 
 
@@ -28,37 +29,39 @@ class PhysicsModel:
     #    For custom physics models, this function should be overridden.
     #    observables are the provided histograms inclusive in processes: nbins
     #    params are the fit parameters
-    def compute_flat(self, params, observables=None):
+    def compute_flat(self, poi, theta, observables=None):
         return observables
 
     # function to compute the transformation of the physics model, has to be differentiable.
     #    For custom physics models, this function can be overridden.
     #    observables are the provided histograms per process: nbins x nprocesses
     #    params are the fit parameters
-    def compute_flat_per_process(self, params, observables=None):
-        return self.compute_flat(params, observables)
+    def compute_flat_per_process(self, poi, theta, observables=None):
+        return self.compute_flat(poi, theta, observables)
 
-    # generic version which should not need to be overridden
-    def make_fun(self, fun_flat, params, inclusive=True):
-        compute = self.compute_flat if inclusive else self.compute_flat_per_process
-
-        def fun():
-            if self.need_observables:
-                exp = compute(params, fun_flat())
-            else:
-                exp = compute(params)
-            return exp
-
-        return fun
+    # # generic version which should not need to be overridden
+    # def make_fun(self, fun_flat, params, inclusive=True):
+    #     compute = self.compute_flat if inclusive else self.compute_flat_per_process
+    #
+    #     def fun():
+    #         if self.need_observables:
+    #             exp = compute(params, fun_flat())
+    #         else:
+    #             exp = compute(params)
+    #         return exp
+    #
+    #     return fun
 
     # generic version which should not need to be overridden
     @tf.function
-    def get_data(self, data, data_cov_inv=None):
+    def get_data(self, poi, theta, data, data_cov_inv=None):
         with tf.GradientTape() as t:
             t.watch(data)
-            output = self.compute_flat(None, data)
+            output = self.compute_flat(poi, theta, data)
 
-        jacobian = t.jacobian(output, data)
+        jacobian = t.jacobian(
+            output, data, unconnected_gradients=tf.UnconnectedGradients.ZERO
+        )
 
         # Ensure the Jacobian has at least 2 dimensions (expand in case output is a scalar)
         if len(jacobian.shape) == 1:
@@ -97,18 +100,18 @@ class PhysicsModelChannel(PhysicsModel):
     def compute_per_process(self, params, observables):
         return self.compute(params, observables)
 
-    def compute_flat(self, params, observables):
+    def compute_flat(self, poi, theta, observables):
         exp = tf.reshape(observables[self.start : self.stop], tuple(self.channel_shape))
-        exp = self.compute(params, exp)
+        exp = self.compute(poi, theta, exp)
         exp = tf.reshape(exp, [-1])  # flatten again
         return exp
 
-    def compute_flat_per_process(self, params, observables):
+    def compute_flat_per_process(self, poi, theta, observables):
         exp = tf.reshape(
             observables[self.start : self.stop],
             (*self.channel_shape, observables.shape[1]),
         )
-        exp = self.compute_per_process(params, exp)
+        exp = self.compute_per_process(poi, theta, exp)
         # flatten again
         flat_shape = (-1, exp.shape[-1])
         exp = tf.reshape(exp, flat_shape)
@@ -123,3 +126,31 @@ class Basemodel(PhysicsModel):
     def __init__(self, indata, key):
         super().__init__(indata, key)
         self.channel_info = indata.channel_info
+
+
+class BasemodelParameters(PhysicsModel):
+    """
+    A class to output pois and nuisances without any transformation, can be used as base class to inherit custom physics models from.
+    """
+
+    need_observables = False
+    has_data = False
+
+    # FIXME get the pois too
+
+    def __init__(self, indata, key):
+        super().__init__(indata, key)
+
+        self.channel_info = {
+            "parms": {
+                "axes": [
+                    hist.axis.StrCategory(
+                        indata.systs,
+                        name="parms",
+                    )
+                ]
+            }
+        }
+
+    def compute_flat(self, poi, theta, observables):
+        return theta

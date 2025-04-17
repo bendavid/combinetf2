@@ -92,3 +92,10 @@ def compute_preconditioner(hess, overwrite_a=False):
         return tf_compute_preconditioner(hess)
     else:
         return scipy_compute_preconditioner(hess, overwrite_a=overwrite_a)
+
+
+def cholesky_adaptive(a):
+    if is_diag(a):
+        return tf.math.sqrt(a)
+    else:
+        return tf.linalg.cholesky(a)

@@ -231,7 +231,7 @@ def make_parser():
         "--physicsModel",
         nargs="+",
         action="append",
-        default=[["Basemodel"]],
+        default=[["Basemodel"], ["BasemodelParameters"]],
         help="""
         add physics model to perform transformations on observables for the prefit and postfit histograms, 
         specifying the model defined in combinetf2/physicsmodels/ followed by arguments passed in the model __init__, 
@@ -322,7 +322,7 @@ def save_hists(args, models, fitter, ws, prefit=True, profile=False):
                 compute_variance=args.computeHistErrors,
                 compute_cov=args.computeHistCov,
                 compute_chi2=not args.noChi2 and model.has_data,
-                compute_global_impacts=args.computeHistImpacts and not prefit,
+                compute_global_impacts=args.computeHistImpacts,
                 profile=profile,
             )
 
@@ -360,7 +360,7 @@ def save_hists(args, models, fitter, ws, prefit=True, profile=False):
         if args.computeVariations:
             if prefit:
                 cov_prefit = fitter.cov.numpy()
-                fitter.cov.assign(fitter.prefit_covariance(unconstrained_err=1.0))
+                fitter.assign_cov(fitter.prefit_covariance(unconstrained_err=1.0))
 
             exp, aux = fitter.expected_events(
                 model,
@@ -379,7 +379,7 @@ def save_hists(args, models, fitter, ws, prefit=True, profile=False):
             )
 
             if prefit:
-                fitter.cov.assign(tf.constant(cov_prefit))
+                fitter.assign_cov(tf.constant(cov_prefit))
 
 
 def fit(args, fitter, ws, dofit=True):
@@ -415,12 +415,108 @@ def fit(args, fitter, ws, dofit=True):
         covval[np.ix_(idxs, idxs)] = cov_ext[np.ix_(idxs_ext, idxs_ext)]
 
         fitter.x.assign(xvals)
-        fitter.cov.assign(tf.constant(covval))
+        fitter.assign_cov(tf.constant(covval))
     else:
         if dofit:
             fitter.minimize()
 
         # compute the covariance matrix and estimated distance to minimum
+
+        if False:
+            fitter.loss_val()
+            fitter.loss_val_grad()
+            val, grad, hess = fitter.loss_val_grad_hess()
+            fitter.loss_val_grad_hessp_fwdrev(grad)
+            fitter.loss_val_grad_hessp_revrev(grad)
+
+            start = time.time()
+            fitter.loss_val()
+            stop = time.time()
+            print("val", stop - start)
+
+            start = time.time()
+            fitter.loss_val_grad()
+            stop = time.time()
+            print("val_grad", stop - start)
+
+            start = time.time()
+            fitter.loss_val_grad_hess()
+            stop = time.time()
+            print("val_grad_hess", stop - start)
+
+            start = time.time()
+            for i in range(200):
+                fitter.loss_val_grad_hessp_fwdrev(grad)
+            stop = time.time()
+            print("loss_val_grad_hessp_fwdrev", stop - start)
+
+            start = time.time()
+            for i in range(200):
+                fitter.loss_val_grad_hessp_revrev(grad)
+            stop = time.time()
+            print("val_grad_hessp_revrev", stop - start)
+
+            import scipy
+
+            start = time.time()
+            chol = tf.linalg.cholesky(hess)
+            stop = time.time()
+            print("cholesky", stop - start)
+
+            start = time.time()
+            scipychol = scipy.linalg.cho_factor(hess.__array__())
+            stop = time.time()
+            print("scipy cholesky", stop - start)
+
+            start = time.time()
+            lu = tf.linalg.lu(hess)
+            stop = time.time()
+            print("lu", stop - start)
+
+            start = time.time()
+            scipylu = scipy.linalg.lu_factor(hess.__array__())
+            stop = time.time()
+            print("scipy lu", stop - start)
+
+            gradv = grad[:, None]
+
+            start = time.time()
+            for i in range(10):
+                hess @ gradv
+            stop = time.time()
+            print("matmul", stop - start)
+
+            start = time.time()
+            for i in range(10):
+                hess.__array__() @ gradv.__array__()
+            stop = time.time()
+            print("scipy matmul", stop - start)
+
+            start = time.time()
+            for i in range(10):
+                tf.linalg.cholesky_solve(chol, gradv)
+            stop = time.time()
+            print("cholesky_solve", stop - start)
+
+            start = time.time()
+            for i in range(10):
+                scipy.linalg.cho_solve(scipychol, gradv.__array__())
+            stop = time.time()
+            print("scipy cholesky_solve", stop - start)
+
+            start = time.time()
+            for i in range(10):
+                tf.linalg.lu_solve(*lu, gradv)
+            stop = time.time()
+            print("lu_solve", stop - start)
+
+            import scipy
+
+            start = time.time()
+            for i in range(10):
+                scipy.linalg.lu_solve(scipylu, gradv.__array__())
+            stop = time.time()
+            print("scipy lu_solve", stop - start)
 
         val, grad, hess = fitter.loss_val_grad_hess()
 

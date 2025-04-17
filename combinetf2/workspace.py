@@ -18,7 +18,7 @@ def getImpactsAxes(indata):
 
 
 def getGlobalImpactsAxes(indata):
-    impact_names = list(indata.systs.astype(str)[indata.nsystnoconstraint :])
+    impact_names = list(indata.systs.astype(str))
     return hist.axis.StrCategory(impact_names, name="impacts")
 
 
@@ -169,10 +169,13 @@ class Workspace:
         hists_data_obs = {}
         hists_nobs = {}
 
+        # FIXME in principle the poi and theta values might be needed for some models
         values_data_obs, variances_data_obs, cov_data_obs = model.get_data(
-            data_obs, data_cov_inv
+            None, None, data_obs, data_cov_inv
         )
-        values_nobs, variances_nobs, cov_nobs = model.get_data(nobs, nobs_cov_inv)
+        values_nobs, variances_nobs, cov_nobs = model.get_data(
+            None, None, nobs, nobs_cov_inv
+        )
 
         for channel, info in model.channel_info.items():
             axes = info["axes"]

@@ -55,7 +55,7 @@ class Project(PhysicsModelChannel):
         exp = tf.transpose(exp, perm=perm)
         return exp
 
-    def compute(self, param, observables):
+    def compute(self, poi, theta, observables):
         return self.project(observables)
 
 

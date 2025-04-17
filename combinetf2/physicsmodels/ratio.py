@@ -132,13 +132,13 @@ class Ratio(PhysicsModel):
             axis_selection_den,
         )
 
-    def compute_flat(self, params, observables):
+    def compute_flat(self, poi, theta, observables):
         num = self.num.select(observables, inclusive=True)
         den = self.den.select(observables, inclusive=True)
 
         return num / den
 
-    def compute_flat_per_process(self, params, observables):
+    def compute_flat_per_process(self, poi, theta, observables):
         num = self.num.select(observables, inclusive=False)
         den = self.den.select(observables, inclusive=False)
 
@@ -155,14 +155,14 @@ class Normratio(Ratio):
     def init(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def compute_flat(self, params, observables):
+    def compute_flat(self, poi, theta, observables):
         num = self.num.select(observables, normalize=True, inclusive=True)
         den = self.den.select(observables, normalize=True, inclusive=True)
         exp = num / den
         exp = tf.reshape(exp, [-1])
         return exp
 
-    def compute_flat_per_process(self, params, observables):
+    def compute_flat_per_process(self, poi, theta, observables):
         num = self.num.select(observables, normalize=True, inclusive=False)
         den = self.den.select(observables, normalize=True, inclusive=False)
         exp = num / den
