@@ -340,10 +340,12 @@ class TensorWriter:
         mirror=True,
         symmetrize="average",
         add_to_data_covariance=False,
+        as_difference=False,
         **kargs,
     ):
         """
         h: either a single histogram with the systematic variation if mirror=True or a list of two histograms with the up and down variation
+        as_difference: if True, interpret the histogram values as the difference with respect to the nominal (i.e. the absolute variation is norm + h)
         """
 
         norm = self.dict_norm[channel][process]
@@ -360,6 +362,10 @@ class TensorWriter:
 
             syst_up = self.get_flat_values(h[0], flow=flow)
             syst_down = self.get_flat_values(h[1], flow=flow)
+
+            if as_difference:
+                syst_up = norm + syst_up
+                syst_down = norm + syst_down
 
             logkup_proc = self.get_logk(
                 syst_up, norm, kfactor, systematic_type=systematic_type
@@ -381,6 +387,10 @@ class TensorWriter:
         elif mirror:
             self._check_hist_and_channel(h, channel)
             syst = self.get_flat_values(h, flow=flow)
+
+            if as_difference:
+                syst = norm + syst
+
             logkavg_proc = self.get_logk(
                 syst, norm, kfactor, systematic_type=systematic_type
             )
