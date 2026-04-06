@@ -71,23 +71,65 @@ class TensorWriter:
         self.dtype = "float64"
         self.chunkSize = 4 * 1024**2
 
+    @staticmethod
+    def _issparse(h):
+        """Check if h is a scipy sparse array/matrix."""
+        return hasattr(h, "toarray") and hasattr(h, "tocoo")
+
+    @staticmethod
+    def _sparse_to_flat_csr(h, dtype):
+        """Flatten a scipy sparse array/matrix to CSR with shape (1, prod(shape)).
+
+        The returned CSR array has sorted indices suitable for searchsorted lookups.
+        """
+        import scipy.sparse
+
+        size = int(np.prod(h.shape))
+        coo = scipy.sparse.coo_array(h)
+        if coo.ndim == 2:
+            flat_indices = np.ravel_multi_index((coo.row, coo.col), h.shape)
+        elif coo.ndim == 1:
+            flat_indices = coo.coords[0]
+        else:
+            raise ValueError(
+                f"Unsupported dimensionality {coo.ndim} for scipy sparse input"
+            )
+        sort_order = np.argsort(flat_indices)
+        sorted_indices = flat_indices[sort_order].astype(np.int32)
+        sorted_data = coo.data[sort_order].astype(dtype)
+        indptr = np.array([0, len(sorted_data)], dtype=np.int32)
+        return scipy.sparse.csr_array(
+            (sorted_data, sorted_indices, indptr), shape=(1, size)
+        )
+
+    def _to_flat_dense(self, h):
+        """Convert any array-like (including scipy sparse) to a flat dense numpy array."""
+        if self._issparse(h):
+            return np.asarray(h.toarray()).flatten().astype(self.dtype)
+        return np.asarray(h).flatten().astype(self.dtype)
+
     def get_flat_values(self, h, flow=False):
         if hasattr(h, "values"):
             values = h.values(flow=flow)
+        elif self._issparse(h):
+            values = np.asarray(h.toarray())
         else:
             values = h
-        return values.flatten().astype(self.dtype)
+        return np.asarray(values).flatten().astype(self.dtype)
 
     def get_flat_variances(self, h, flow=False):
         if hasattr(h, "variances"):
             variances = h.variances(flow=flow)
+        elif self._issparse(h):
+            variances = np.asarray(h.toarray())
         else:
             variances = h
 
+        variances = np.asarray(variances).flatten().astype(self.dtype)
         if (variances < 0.0).any():
             raise ValueError("Negative variances encountered")
 
-        return variances.flatten().astype(self.dtype)
+        return variances
 
     def add_data(self, h, channel="ch0", variances=None):
         self._check_hist_and_channel(h, channel)
@@ -134,18 +176,40 @@ class TensorWriter:
             self.dict_logkhalfdiff_indices[channel][name] = {}
 
         flow = self.channels[channel]["flow"]
-        norm = self.get_flat_values(h, flow)
-        sumw2 = self.get_flat_variances(h if variances is None else variances, flow)
 
-        if not self.allow_negative_expectation:
-            norm = np.maximum(norm, 0.0)
+        if self.sparse and self._issparse(h):
+            # Store as flat CSR, avoiding full dense conversion
+            norm = self._sparse_to_flat_csr(h, self.dtype)
+            if not np.all(np.isfinite(norm.data)):
+                raise RuntimeError(
+                    f"NaN or Inf values encountered in nominal histogram for {name}!"
+                )
+            if not self.allow_negative_expectation:
+                has_negative = np.any(norm.data < 0.0)
+                if has_negative:
+                    norm = norm.copy()
+                    norm.data[:] = np.maximum(norm.data, 0.0)
+                    norm.eliminate_zeros()
+        else:
+            norm = self.get_flat_values(h, flow)
+            if not self.allow_negative_expectation:
+                norm = np.maximum(norm, 0.0)
+            if not np.all(np.isfinite(norm)):
+                raise RuntimeError(
+                    f"{len(norm)-sum(np.isfinite(norm))} NaN or Inf values encountered in nominal histogram for {name}!"
+                )
+
+        # variances are always stored dense (needed for sumw2 output assembly)
+        if variances is not None:
+            sumw2 = self.get_flat_variances(variances, flow)
+        elif self._issparse(h):
+            sumw2 = self._to_flat_dense(h)
+        else:
+            sumw2 = self.get_flat_variances(h, flow)
+
         if not np.all(np.isfinite(sumw2)):
             raise RuntimeError(
                 f"{len(sumw2)-sum(np.isfinite(sumw2))} NaN or Inf values encountered in variances for {name}!"
-            )
-        if not np.all(np.isfinite(norm)):
-            raise RuntimeError(
-                f"{len(norm)-sum(np.isfinite(norm))} NaN or Inf values encountered in nominal histogram for {name}!"
             )
 
         self.dict_norm[channel][name] = norm
@@ -193,6 +257,13 @@ class TensorWriter:
                     \nHistogram axes: {[a.edges for a in axes]}
                     \nChannel axes: {[a.edges for a in channel_axes]}
                     """)
+        elif self._issparse(h):
+            size_in = int(np.prod(h.shape))
+            size_this = int(np.prod([len(a) for a in self.channels[channel]["axes"]]))
+            if size_in != size_this:
+                raise RuntimeError(
+                    f"Total number of elements in sparse input different from channel size '{size_in}' != '{size_this}'"
+                )
         else:
             shape_in = h.shape
             shape_this = tuple([len(a) for a in self.channels[channel]["axes"]])
@@ -210,9 +281,21 @@ class TensorWriter:
         channel,
         symmetrize="average",
         add_to_data_covariance=False,
+        _sparse_info=None,
         **kargs,
     ):
+        """Compute symmetrized logk from asymmetric up/down variations.
+
+        When _sparse_info is set to (nnz_indices, size), logkup/logkdown are value
+        arrays at those indices and internal book_logk calls use sparse tuples.
+        """
         var_name_out = name
+
+        def _wrap(vals):
+            """Wrap values as sparse tuple if in sparse mode."""
+            if _sparse_info is not None:
+                return (_sparse_info[0], vals, _sparse_info[1])
+            return vals
 
         if symmetrize == "conservative":
             # symmetrize by largest magnitude of up and down variations
@@ -238,7 +321,9 @@ class TensorWriter:
             var_name_out_diff = name + "SymDiff"
 
             # special case, book the extra systematic
-            self.book_logk_avg(logkdiffavg_proc, channel, process, var_name_out_diff)
+            self.book_logk_avg(
+                _wrap(logkdiffavg_proc), channel, process, var_name_out_diff
+            )
             self.book_systematic(
                 var_name_out_diff,
                 add_to_data_covariance=add_to_data_covariance,
@@ -255,7 +340,7 @@ class TensorWriter:
             logkavg_proc = 0.5 * (logkup + logkdown)
             logkhalfdiff_proc = 0.5 * (logkup - logkdown)
 
-            self.book_logk_halfdiff(logkhalfdiff_proc, channel, process, name)
+            self.book_logk_halfdiff(_wrap(logkhalfdiff_proc), channel, process, name)
         logkup = None
         logkdown = None
 
@@ -289,45 +374,161 @@ class TensorWriter:
 
         for p, u in zip(process, uncertainty):
             norm = self.dict_norm[channel][p]
-            if isinstance(u, (list, tuple, np.ndarray)):
-                if len(u) != 2:
-                    raise RuntimeError(
-                        f"lnN uncertainty can only be a scalar for a symmetric or a list of 2 elements for asymmetric lnN uncertainties, but got a list of {len(u)} elements"
+
+            if self._issparse(norm):
+                # Sparse norm path: compute logk at nonzero positions only
+                norm_vals = norm.data
+                nnz_idx = norm.indices
+                size = norm.shape[1]
+
+                if isinstance(u, (list, tuple, np.ndarray)):
+                    if len(u) != 2:
+                        raise RuntimeError(
+                            f"lnN uncertainty can only be a scalar for a symmetric or a list of 2 elements for asymmetric lnN uncertainties, but got a list of {len(u)} elements"
+                        )
+                    logkup_proc = self._get_logk_sparse(
+                        norm_vals * u[0], norm_vals, 1.0, systematic_type
                     )
-                # asymmetric lnN uncertainty
-                syst_up = norm * u[0]
-                syst_down = norm * u[1]
+                    logkdown_proc = -self._get_logk_sparse(
+                        norm_vals * u[1], norm_vals, 1.0, systematic_type
+                    )
+                    logkavg_proc, var_name_out = self._compute_asym_syst(
+                        logkup_proc,
+                        logkdown_proc,
+                        name,
+                        process,
+                        channel,
+                        symmetrize=symmetrize,
+                        add_to_data_covariance=add_to_data_covariance,
+                        _sparse_info=(nnz_idx, size),
+                        **kargs,
+                    )
+                else:
+                    logkavg_proc = self._get_logk_sparse(
+                        norm_vals * u, norm_vals, 1.0, systematic_type
+                    )
 
-                logkup_proc = self.get_logk(
-                    syst_up, norm, systematic_type=systematic_type
-                )
-                logkdown_proc = -self.get_logk(
-                    syst_down, norm, systematic_type=systematic_type
-                )
-
-                logkavg_proc, var_name_out = self._compute_asym_syst(
-                    logkup_proc,
-                    logkdown_proc,
-                    name,
-                    process,
-                    channel,
-                    symmetrize=symmetrize,
-                    add_to_data_covariance=add_to_data_covariance,
-                    **kargs,
+                self.book_logk_avg(
+                    (nnz_idx, logkavg_proc, size), channel, p, var_name_out
                 )
             else:
-                syst = norm * u
-                logkavg_proc = self.get_logk(
-                    syst, norm, systematic_type=systematic_type
-                )
+                if isinstance(u, (list, tuple, np.ndarray)):
+                    if len(u) != 2:
+                        raise RuntimeError(
+                            f"lnN uncertainty can only be a scalar for a symmetric or a list of 2 elements for asymmetric lnN uncertainties, but got a list of {len(u)} elements"
+                        )
+                    # asymmetric lnN uncertainty
+                    syst_up = norm * u[0]
+                    syst_down = norm * u[1]
 
-            self.book_logk_avg(logkavg_proc, channel, p, var_name_out)
+                    logkup_proc = self.get_logk(
+                        syst_up, norm, systematic_type=systematic_type
+                    )
+                    logkdown_proc = -self.get_logk(
+                        syst_down, norm, systematic_type=systematic_type
+                    )
+
+                    logkavg_proc, var_name_out = self._compute_asym_syst(
+                        logkup_proc,
+                        logkdown_proc,
+                        name,
+                        process,
+                        channel,
+                        symmetrize=symmetrize,
+                        add_to_data_covariance=add_to_data_covariance,
+                        **kargs,
+                    )
+                else:
+                    syst = norm * u
+                    logkavg_proc = self.get_logk(
+                        syst, norm, systematic_type=systematic_type
+                    )
+
+                self.book_logk_avg(logkavg_proc, channel, p, var_name_out)
 
         self.book_systematic(
             var_name_out,
             groups=groups,
             add_to_data_covariance=add_to_data_covariance,
             **kargs,
+        )
+
+    def _add_systematic_sparse(
+        self,
+        h,
+        name,
+        process,
+        channel,
+        norm,
+        kfactor,
+        mirror,
+        symmetrize,
+        add_to_data_covariance,
+        as_difference,
+        **kargs,
+    ):
+        """Sparse path for add_systematic when norm is stored as scipy sparse CSR.
+
+        Computes logk only at norm's nonzero positions, avoiding full-size dense
+        intermediate arrays.  The logk result is a tuple (indices, values, size).
+        """
+        systematic_type = "normal" if add_to_data_covariance else self.systematic_type
+        flow = self.channels[channel]["flow"]
+        nnz_idx = norm.indices
+        norm_vals = norm.data
+        size = norm.shape[1]
+
+        var_name_out = name
+
+        if isinstance(h, (list, tuple)):
+            self._check_hist_and_channel(h[0], channel)
+            self._check_hist_and_channel(h[1], channel)
+
+            syst_up_vals = self._get_syst_at_norm_nnz(h[0], norm, flow)
+            syst_down_vals = self._get_syst_at_norm_nnz(h[1], norm, flow)
+
+            if as_difference:
+                syst_up_vals = norm_vals + syst_up_vals
+                syst_down_vals = norm_vals + syst_down_vals
+
+            logkup_vals = self._get_logk_sparse(
+                syst_up_vals, norm_vals, kfactor, systematic_type
+            )
+            logkdown_vals = -self._get_logk_sparse(
+                syst_down_vals, norm_vals, kfactor, systematic_type
+            )
+
+            logkavg_vals, var_name_out = self._compute_asym_syst(
+                logkup_vals,
+                logkdown_vals,
+                name,
+                process,
+                channel,
+                symmetrize,
+                add_to_data_covariance,
+                _sparse_info=(nnz_idx, size),
+                **kargs,
+            )
+        elif mirror:
+            self._check_hist_and_channel(h, channel)
+
+            syst_vals = self._get_syst_at_norm_nnz(h, norm, flow)
+
+            if as_difference:
+                syst_vals = norm_vals + syst_vals
+
+            logkavg_vals = self._get_logk_sparse(
+                syst_vals, norm_vals, kfactor, systematic_type
+            )
+        else:
+            raise RuntimeError(
+                "Only one histogram given but mirror=False, can not construct a variation"
+            )
+
+        logkavg_proc = (nnz_idx, logkavg_vals, size)
+        self.book_logk_avg(logkavg_proc, channel, process, var_name_out)
+        self.book_systematic(
+            var_name_out, add_to_data_covariance=add_to_data_covariance, **kargs
         )
 
     def add_systematic(
@@ -349,6 +550,22 @@ class TensorWriter:
         """
 
         norm = self.dict_norm[channel][process]
+
+        # Use sparse path when norm is stored as scipy sparse CSR
+        if self._issparse(norm):
+            return self._add_systematic_sparse(
+                h,
+                name,
+                process,
+                channel,
+                norm,
+                kfactor,
+                mirror,
+                symmetrize,
+                add_to_data_covariance,
+                as_difference,
+                **kargs,
+            )
 
         var_name_out = name
 
@@ -457,6 +674,37 @@ class TensorWriter:
 
         self.has_beta_variations = True
 
+    @staticmethod
+    def _sparse_values_at(sparse_csr, indices):
+        """Extract values from a flat CSR array at the given flat indices.
+
+        Uses searchsorted on the sorted CSR indices to avoid any dense conversion.
+        Returns a dense 1D array of values at the requested positions.
+        """
+        result = np.zeros(len(indices), dtype=sparse_csr.dtype)
+        positions = np.searchsorted(sparse_csr.indices, indices)
+        valid = (positions < len(sparse_csr.indices)) & (
+            sparse_csr.indices[positions] == indices
+        )
+        result[valid] = sparse_csr.data[positions[valid]]
+        return result
+
+    def _get_syst_at_norm_nnz(self, h, norm_csr, flow):
+        """Extract flat systematic values only at norm's nonzero positions.
+
+        h can be a histogram, scipy sparse, or dense array.
+        Returns a 1D dense array of length norm_csr.nnz.
+        """
+        nnz_idx = norm_csr.indices
+        if hasattr(h, "values"):
+            values = h.values(flow=flow)
+            return values.flatten().astype(self.dtype)[nnz_idx]
+        elif self._issparse(h):
+            syst_csr = self._sparse_to_flat_csr(h, self.dtype)
+            return self._sparse_values_at(syst_csr, nnz_idx)
+        else:
+            return np.asarray(h).flatten().astype(self.dtype)[nnz_idx]
+
     def get_logk(self, syst, norm, kfac=1.0, systematic_type=None):
         if not np.all(np.isfinite(syst)):
             raise RuntimeError(
@@ -486,6 +734,34 @@ class TensorWriter:
                 f"Invalid systematic_type {systematic_type}, valid choices are 'log_normal' or 'normal'"
             )
 
+    def _get_logk_sparse(self, syst_vals, norm_vals, kfac, systematic_type):
+        """Compute logk values at norm's nonzero positions only.
+
+        syst_vals and norm_vals are dense 1D arrays of equal length (nnz of norm).
+        Returns a 1D dense array of logk values at those positions.
+        """
+        if not np.all(np.isfinite(syst_vals)):
+            raise RuntimeError(
+                f"{len(syst_vals)-sum(np.isfinite(syst_vals))} NaN or Inf values encountered in systematic!"
+            )
+
+        if systematic_type == "log_normal":
+            _logk = kfac * np.log(syst_vals / norm_vals)
+            _logk = np.where(
+                np.equal(np.sign(norm_vals * syst_vals), 1),
+                _logk,
+                self.logkepsilon,
+            )
+            if self.clipSystVariations > 0.0:
+                _logk = np.clip(_logk, -self.clip, self.clip)
+            return _logk
+        elif systematic_type == "normal":
+            return kfac * (syst_vals - norm_vals)
+        else:
+            raise RuntimeError(
+                f"Invalid systematic_type {systematic_type}, valid choices are 'log_normal' or 'normal'"
+            )
+
     def book_logk_avg(self, *args):
         self.book_logk(
             self.dict_logkavg,
@@ -509,6 +785,16 @@ class TensorWriter:
         process,
         syst_name,
     ):
+        if isinstance(logk, tuple):
+            # Sparse logk from _add_systematic_sparse: (indices, values, size)
+            nnz_idx, logk_vals, size = logk
+            nonzero_mask = logk_vals != 0.0
+            indices = nnz_idx[nonzero_mask].reshape(-1, 1)
+            values = logk_vals[nonzero_mask]
+            dict_logk_indices[channel][process][syst_name] = indices
+            dict_logk[channel][process][syst_name] = values
+            return
+
         norm = self.dict_norm[channel][process]
         # ensure that systematic tensor is sparse where normalization matrix is sparse
         logk = np.where(np.equal(norm, 0.0), 0.0, logk)
@@ -580,7 +866,11 @@ class TensorWriter:
                 if proc not in self.dict_norm[chan]:
                     continue
 
-                sumw[ibin : ibin + nbinschan, iproc] = self.dict_norm[chan][proc]
+                norm_proc = self.dict_norm[chan][proc]
+                if self._issparse(norm_proc):
+                    sumw[ibin + norm_proc.indices, iproc] = norm_proc.data
+                else:
+                    sumw[ibin : ibin + nbinschan, iproc] = norm_proc
                 sumw2[ibin : ibin + nbinschan, iproc] = self.dict_sumw2[chan][proc]
 
             if not chan_info["masked"]:
@@ -623,29 +913,56 @@ class TensorWriter:
                         continue
                     norm_proc = dict_norm_chan[proc]
 
-                    norm_indices = np.transpose(np.nonzero(norm_proc))
-                    norm_values = np.reshape(norm_proc[norm_indices], [-1])
+                    if self._issparse(norm_proc):
+                        # Use scipy sparse structure directly
+                        norm_indices = norm_proc.indices.reshape(-1, 1)
+                        norm_values = norm_proc.data.copy()
 
-                    nvals = len(norm_values)
-                    oldlength = norm_sparse_size
-                    norm_sparse_size = oldlength + nvals
-                    norm_sparse_indices.resize([norm_sparse_size, 2])
-                    norm_sparse_values.resize([norm_sparse_size])
+                        nvals = len(norm_values)
+                        oldlength = norm_sparse_size
+                        norm_sparse_size = oldlength + nvals
+                        norm_sparse_indices.resize([norm_sparse_size, 2])
+                        norm_sparse_values.resize([norm_sparse_size])
 
-                    out_indices = np.array([[ibin, iproc]]) + np.pad(
-                        norm_indices, ((0, 0), (0, 1)), "constant"
-                    )
-                    norm_indices = None
+                        out_indices = np.array([[ibin, iproc]]) + np.pad(
+                            norm_indices, ((0, 0), (0, 1)), "constant"
+                        )
+                        norm_indices = None
 
-                    norm_sparse_indices[oldlength:norm_sparse_size] = out_indices
-                    out_indices = None
+                        norm_sparse_indices[oldlength:norm_sparse_size] = out_indices
+                        out_indices = None
 
-                    norm_sparse_values[oldlength:norm_sparse_size] = norm_values
-                    norm_values = None
+                        norm_sparse_values[oldlength:norm_sparse_size] = norm_values
+                        norm_values = None
 
-                    norm_idx_map = (
-                        np.cumsum(np.not_equal(norm_proc, 0.0)) - 1 + oldlength
-                    )
+                        # sorted CSR indices allow searchsorted in logk mapping below
+                        norm_nnz_idx = norm_proc.indices
+                        oldlength_norm = oldlength
+                    else:
+                        norm_indices = np.transpose(np.nonzero(norm_proc))
+                        norm_values = np.reshape(norm_proc[norm_indices], [-1])
+
+                        nvals = len(norm_values)
+                        oldlength = norm_sparse_size
+                        norm_sparse_size = oldlength + nvals
+                        norm_sparse_indices.resize([norm_sparse_size, 2])
+                        norm_sparse_values.resize([norm_sparse_size])
+
+                        out_indices = np.array([[ibin, iproc]]) + np.pad(
+                            norm_indices, ((0, 0), (0, 1)), "constant"
+                        )
+                        norm_indices = None
+
+                        norm_sparse_indices[oldlength:norm_sparse_size] = out_indices
+                        out_indices = None
+
+                        norm_sparse_values[oldlength:norm_sparse_size] = norm_values
+                        norm_values = None
+
+                        norm_idx_map = (
+                            np.cumsum(np.not_equal(norm_proc, 0.0)) - 1 + oldlength
+                        )
+                        norm_nnz_idx = None
 
                     dict_logkavg_proc_indices = dict_logkavg_chan_indices[proc]
                     dict_logkavg_proc_values = dict_logkavg_chan_values[proc]
@@ -667,7 +984,15 @@ class TensorWriter:
                         # first dimension of output indices are NOT in the dense [nbin,nproc] space, but rather refer to indices in the norm_sparse vectors
                         # second dimension is flattened in the [2,nsyst] space, where logkavg corresponds to [0,isyst] flattened to isyst
                         # two dimensions are kept in separate arrays for now to reduce the number of copies needed later
-                        out_normindices = norm_idx_map[logkavg_proc_indices]
+                        if norm_nnz_idx is not None:
+                            # scipy sparse norm: use searchsorted on sorted CSR indices
+                            flat_positions = logkavg_proc_indices.flatten()
+                            out_normindices = (
+                                np.searchsorted(norm_nnz_idx, flat_positions)
+                                + oldlength_norm
+                            ).reshape(-1, 1)
+                        else:
+                            out_normindices = norm_idx_map[logkavg_proc_indices]
                         logkavg_proc_indices = None
 
                         logk_sparse_normindices[oldlength:logk_sparse_size] = (
@@ -700,7 +1025,16 @@ class TensorWriter:
                             # first dimension of output indices are NOT in the dense [nbin,nproc] space, but rather refer to indices in the norm_sparse vectors
                             # second dimension is flattened in the [2,nsyst] space, where logkhalfdiff corresponds to [1,isyst] flattened to nsyst + isyst
                             # two dimensions are kept in separate arrays for now to reduce the number of copies needed later
-                            out_normindices = norm_idx_map[logkhalfdiff_proc_indices]
+                            if norm_nnz_idx is not None:
+                                flat_positions = logkhalfdiff_proc_indices.flatten()
+                                out_normindices = (
+                                    np.searchsorted(norm_nnz_idx, flat_positions)
+                                    + oldlength_norm
+                                ).reshape(-1, 1)
+                            else:
+                                out_normindices = norm_idx_map[
+                                    logkhalfdiff_proc_indices
+                                ]
                             logkhalfdiff_proc_indices = None
 
                             logk_sparse_normindices[oldlength:logk_sparse_size] = (

@@ -61,7 +61,16 @@ def make_histograms():
     )
 
 
-def make_test_tensor(outdir, sparse=False, as_difference=False):
+def _to_scipy_sparse(h):
+    """Convert a hist histogram to a scipy sparse CSR array of its values."""
+    import scipy.sparse
+
+    return scipy.sparse.csr_array(h.values())
+
+
+def make_test_tensor(
+    outdir, sparse=False, as_difference=False, scipy_sparse_input=False
+):
     """Create a simple tensor with signal + background + one shape systematic."""
 
     hists = make_histograms()
@@ -71,14 +80,34 @@ def make_test_tensor(outdir, sparse=False, as_difference=False):
     writer.add_channel(hists["data"].axes, "ch0")
     writer.add_data(hists["data"], "ch0")
 
-    writer.add_process(hists["sig"], "sig", "ch0", signal=True)
-    writer.add_process(hists["bkg"], "bkg", "ch0")
+    if scipy_sparse_input:
+        writer.add_process(
+            _to_scipy_sparse(hists["sig"]),
+            "sig",
+            "ch0",
+            signal=True,
+            variances=hists["sig"].variances(),
+        )
+        writer.add_process(
+            _to_scipy_sparse(hists["bkg"]),
+            "bkg",
+            "ch0",
+            variances=hists["bkg"].variances(),
+        )
+    else:
+        writer.add_process(hists["sig"], "sig", "ch0", signal=True)
+        writer.add_process(hists["bkg"], "bkg", "ch0")
 
     writer.add_norm_systematic("bkg_norm", "bkg", "ch0", 1.05)
 
     if as_difference:
+        syst_up = hists["syst_up_diff"]
+        syst_dn = hists["syst_dn_diff"]
+        if scipy_sparse_input:
+            syst_up = _to_scipy_sparse(syst_up)
+            syst_dn = _to_scipy_sparse(syst_dn)
         writer.add_systematic(
-            [hists["syst_up_diff"], hists["syst_dn_diff"]],
+            [syst_up, syst_dn],
             "bkg_shape",
             "bkg",
             "ch0",
@@ -86,8 +115,13 @@ def make_test_tensor(outdir, sparse=False, as_difference=False):
             as_difference=True,
         )
     else:
+        syst_up = hists["syst_up"]
+        syst_dn = hists["syst_dn"]
+        if scipy_sparse_input:
+            syst_up = _to_scipy_sparse(syst_up)
+            syst_dn = _to_scipy_sparse(syst_dn)
         writer.add_systematic(
-            [hists["syst_up"], hists["syst_dn"]],
+            [syst_up, syst_dn],
             "bkg_shape",
             "bkg",
             "ch0",
@@ -97,6 +131,8 @@ def make_test_tensor(outdir, sparse=False, as_difference=False):
     suffix = "sparse" if sparse else "dense"
     if as_difference:
         suffix += "_diff"
+    if scipy_sparse_input:
+        suffix += "_scipy"
     name = f"test_{suffix}"
     writer.write(outfolder=outdir, outfilename=name)
     return os.path.join(outdir, f"{name}.hdf5")
@@ -116,6 +152,7 @@ def make_options(**kwargs):
         prefitUnconstrainedNuisanceUncertainty=0.0,
         freezeParameters=[],
         setConstraintMinimum=[],
+        unblind=[],
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -206,17 +243,28 @@ def main():
     tf.config.experimental.enable_op_determinism()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # create tensors in all four modes
-        dense_file = make_test_tensor(tmpdir, sparse=False)
-        sparse_file = make_test_tensor(tmpdir, sparse=True)
-        dense_diff_file = make_test_tensor(tmpdir, sparse=False, as_difference=True)
-        sparse_diff_file = make_test_tensor(tmpdir, sparse=True, as_difference=True)
-
+        # create tensors in all modes
         configs = [
-            ("Dense", dense_file),
-            ("Sparse", sparse_file),
-            ("Dense (as_difference)", dense_diff_file),
-            ("Sparse (as_difference)", sparse_diff_file),
+            ("Dense", make_test_tensor(tmpdir, sparse=False)),
+            ("Sparse", make_test_tensor(tmpdir, sparse=True)),
+            (
+                "Dense (as_difference)",
+                make_test_tensor(tmpdir, sparse=False, as_difference=True),
+            ),
+            (
+                "Sparse (as_difference)",
+                make_test_tensor(tmpdir, sparse=True, as_difference=True),
+            ),
+            (
+                "Sparse (scipy)",
+                make_test_tensor(tmpdir, sparse=True, scipy_sparse_input=True),
+            ),
+            (
+                "Sparse (scipy+diff)",
+                make_test_tensor(
+                    tmpdir, sparse=True, as_difference=True, scipy_sparse_input=True
+                ),
+            ),
         ]
 
         results = {}
@@ -236,6 +284,8 @@ def main():
             ("Dense", "Sparse"),
             ("Dense", "Dense (as_difference)"),
             ("Dense", "Sparse (as_difference)"),
+            ("Dense", "Sparse (scipy)"),
+            ("Dense", "Sparse (scipy+diff)"),
         ]
 
         all_ok = True
