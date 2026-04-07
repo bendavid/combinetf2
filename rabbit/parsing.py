@@ -203,6 +203,24 @@ def common_parser():
         help="Mnimizer method used in scipy.optimize.minimize for the nominal fit minimization",
     )
     parser.add_argument(
+        "--hvpMethod",
+        default="revrev",
+        type=str,
+        choices=["fwdrev", "revrev"],
+        help="Autodiff mode for the Hessian-vector product. 'revrev' (reverse-over-reverse) "
+        "is the default and works well in combination with --jitCompile. 'fwdrev' "
+        "(forward-over-reverse, via tf.autodiff.ForwardAccumulator) is an alternative.",
+    )
+    parser.add_argument(
+        "--noJitCompile",
+        dest="jitCompile",
+        default=True,
+        action="store_false",
+        help="Disable XLA jit_compile=True on the loss/gradient/HVP tf.functions. "
+        "jit_compile is enabled by default and substantially speeds up sparse-mode fits "
+        "with very large numbers of parameters.",
+    )
+    parser.add_argument(
         "--chisqFit",
         default=False,
         action="store_true",
