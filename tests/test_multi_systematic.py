@@ -440,6 +440,93 @@ def main():
         ), "logk mismatch (masked SparseHist flow vs masked individual)"
         print("PASS: SparseHist on masked flow=True channel matches individual")
 
+        # --- Batched SparseHist path: single hist, mirror=True, as_difference=True ---
+        # This exercises the vectorized fast path in add_systematic which
+        # bypasses the per-slice dispatch entirely. We compare byte-for-byte
+        # against the equivalent per-syst manual booking (which goes through
+        # the regular single-syst path) using log_normal systematic type on
+        # a dense process, on data that includes positions where the delta
+        # pushes the bin negative (so the logkepsilon fallback is exercised).
+        import scipy.sparse as _sp
+        from wums.sparse_hist import SparseHist as _SH
+
+        nbatch = 12
+        ax_bx = hist.axis.Regular(8, -4, 4, name="x")
+        ax_by = hist.axis.Regular(6, 0, 3, name="y")
+        ax_bs = hist.axis.Integer(
+            0, nbatch, underflow=False, overflow=False, name="syst"
+        )
+
+        rng = np.random.default_rng(17)
+        h_bproc = hist.Hist(ax_bx, ax_by, storage=hist.storage.Weight())
+        x_v = rng.normal(0, 1, 1000)
+        y_v = rng.uniform(0, 3, 1000)
+        h_bproc.fill(x_v, y_v, weight=np.ones(1000))
+        h_bdata = hist.Hist(ax_bx, ax_by, storage=hist.storage.Double())
+        h_bdata.fill(x_v, y_v)
+
+        ext_shape = (ax_bx.extent, ax_by.extent, ax_bs.extent)
+        dense_systs = rng.normal(0, 0.1, ext_shape)
+        sparse_mask = rng.random(ext_shape) < 0.5
+        dense_systs[sparse_mask] = 0
+        flat_data = dense_systs.reshape(1, -1)
+        sh_batch = _SH(_sp.csr_array(flat_data), [ax_bx, ax_by, ax_bs])
+
+        def make_batch_writer(use_batched):
+            w = tensorwriter.TensorWriter(sparse=True, systematic_type="log_normal")
+            w.add_channel([ax_bx, ax_by], "ch0")
+            w.add_data(h_bdata, "ch0")
+            w.add_process(h_bproc, "proc", "ch0", signal=True)
+            if use_batched:
+                w.add_systematic(
+                    sh_batch,
+                    "syst",
+                    "proc",
+                    "ch0",
+                    mirror=True,
+                    as_difference=True,
+                    constrained=False,
+                    groups=["g"],
+                )
+            else:
+                for i in range(nbatch):
+                    sub_dense = dense_systs[:, :, i]
+                    sub_flat = _sp.csr_array(sub_dense.reshape(1, -1))
+                    sub_sh = _SH(sub_flat, [ax_bx, ax_by])
+                    w.add_systematic(
+                        sub_sh,
+                        f"syst_{i}",
+                        "proc",
+                        "ch0",
+                        mirror=True,
+                        as_difference=True,
+                        constrained=False,
+                        groups=["g"],
+                        syst_axes=[],
+                    )
+            return w
+
+        wb = make_batch_writer(True)
+        wb.write(outfolder=tmpdir, outfilename="batch_fast")
+        wm = make_batch_writer(False)
+        wm.write(outfolder=tmpdir, outfilename="batch_manual")
+
+        bf = read_hdf5_arrays(os.path.join(tmpdir, "batch_fast.hdf5"))
+        bm = read_hdf5_arrays(os.path.join(tmpdir, "batch_manual.hdf5"))
+
+        print("Batched-path fast systs:    ", bf["systs"])
+        print("Batched-path manual systs:  ", bm["systs"])
+        assert (
+            bf["systs"] == bm["systs"]
+        ), f"syst lists differ: fast {bf['systs']} vs manual {bm['systs']}"
+        assert np.allclose(
+            bf["hnorm"], bm["hnorm"]
+        ), "hnorm mismatch (batched fast vs manual)"
+        assert np.allclose(
+            bf["hlogk"], bm["hlogk"]
+        ), "hlogk mismatch (batched fast vs manual)"
+        print("PASS: batched SparseHist path matches per-syst manual booking")
+
         print()
         print("ALL CHECKS PASSED")
 

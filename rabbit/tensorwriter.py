@@ -802,6 +802,321 @@ class TensorWriter:
 
         return slices
 
+    def _detect_extra_syst_axes(self, h, channel, syst_axes):
+        """Determine the extra (systematic) axes of ``h`` for a given channel.
+
+        Returns a tuple ``(h_ref, is_pair, extra_axis_names)`` if there are
+        extra axes, or ``None`` otherwise. Shared by ``_get_systematic_slices``
+        and the batched fast path so the detection logic stays in one place.
+        """
+        if syst_axes is not None and len(syst_axes) == 0:
+            return None
+
+        if isinstance(h, (list, tuple)):
+            h_ref = h[0]
+            is_pair = True
+        else:
+            h_ref = h
+            is_pair = False
+
+        if not hasattr(h_ref, "axes"):
+            return None
+
+        h_axis_names = [a.name for a in h_ref.axes]
+        channel_axis_names = [a.name for a in self.channels[channel]["axes"]]
+
+        if syst_axes is None:
+            extra_axis_names = [n for n in h_axis_names if n not in channel_axis_names]
+        else:
+            for n in syst_axes:
+                if n not in h_axis_names:
+                    raise RuntimeError(
+                        f"Requested systematic axis '{n}' not found in histogram axes {h_axis_names}"
+                    )
+                if n in channel_axis_names:
+                    raise RuntimeError(
+                        f"Systematic axis '{n}' overlaps with channel axes {channel_axis_names}"
+                    )
+            extra_axis_names = list(syst_axes)
+
+        if not extra_axis_names:
+            return None
+
+        return h_ref, is_pair, extra_axis_names
+
+    def _add_systematics_sparsehist_batched(
+        self,
+        h,
+        name,
+        process,
+        channel,
+        kfactor,
+        as_difference,
+        extra_axis_names,
+        **kargs,
+    ):
+        """Vectorized booking of one shape systematic per bin combination on
+        the extra axes of a single ``SparseHist`` input.
+
+        Used as a fast path for the multi-systematic dispatch when the input
+        is a single (non-paired) :class:`wums.sparse_hist.SparseHist` with at
+        least one extra axis beyond the channel axes and ``as_difference=True``.
+
+        All per-entry math (channel-flat-index computation, norm lookup,
+        sign-flip-protected logk evaluation) is done once over the entire
+        ~nnz array using vectorised numpy operations. The result is then
+        partitioned by linear systematic index via a single ``argsort`` +
+        ``searchsorted`` and bulk-inserted into ``dict_logkavg`` /
+        ``dict_logkavg_indices`` (sparse storage) or ``dict_logkavg`` (dense
+        storage). Empty bin combinations on the extra axes still get an entry
+        and a corresponding ``book_systematic`` call so they appear in the
+        fit parameter list.
+        """
+        import scipy.sparse  # noqa: F401  used implicitly via SparseHist methods
+
+        chan_info = self.channels[channel]
+        chan_flow = chan_info["flow"]
+        channel_axes_obj = chan_info["axes"]
+        channel_axis_names = [a.name for a in channel_axes_obj]
+
+        h_axis_names = [a.name for a in h.axes]
+        for n in channel_axis_names:
+            if n not in h_axis_names:
+                raise RuntimeError(
+                    f"Channel axis '{n}' not found in histogram axes {h_axis_names}"
+                )
+
+        extra_positions = [h_axis_names.index(n) for n in extra_axis_names]
+        keep_positions = [h_axis_names.index(n) for n in channel_axis_names]
+        keep_axes = [h.axes[i] for i in keep_positions]
+        extra_axes = [h.axes[i] for i in extra_positions]
+
+        extra_sizes = [int(len(a)) for a in extra_axes]
+        n_total_systs = int(np.prod(extra_sizes))
+
+        keep_extent = tuple(int(a.extent) for a in keep_axes)
+        keep_no_flow = tuple(int(len(a)) for a in keep_axes)
+        target_size = (
+            int(np.prod(keep_extent)) if chan_flow else int(np.prod(keep_no_flow))
+        )
+
+        norm = self.dict_norm[channel][process]
+        norm_is_sparse = self._issparse(norm)
+        systematic_type = self.systematic_type
+
+        # ---- Step 1: get h's flat with-flow (indices, values) ----
+        # Access the SparseHist's internal flat buffers directly to skip the
+        # O(nnz log nnz) sort that ``to_flat_csr`` would otherwise do (we do
+        # our own sort later, by syst index, so pre-sorting by flat index
+        # would be wasted work).
+        flat_idx = np.asarray(h._flat_indices, dtype=np.int64)
+        delta_vals = np.asarray(h._values, dtype=np.float64)
+
+        if len(flat_idx) > 0:
+            multi = np.unravel_index(flat_idx, h.shape)
+            # free flat_idx — we only need the per-axis multi-dim arrays now
+            flat_idx = None
+
+            # ---- Step 2: drop entries in flow bins ----
+            # Build the validity mask in a single pass over all relevant axes
+            # (extra axes always, channel axes only if the channel is no-flow).
+            if chan_flow:
+                check_positions = list(extra_positions)
+            else:
+                check_positions = list(extra_positions) + list(keep_positions)
+
+            valid = None
+            for ax_pos in check_positions:
+                ax = h.axes[ax_pos]
+                u = SparseHist._underflow_offset(ax)
+                s = int(len(ax))
+                ax_arr = multi[ax_pos]
+                if u == 0:
+                    cond = ax_arr < s
+                else:
+                    # 1 underflow bin: valid = ax_arr in [1, 1+s)
+                    cond = (ax_arr >= u) & (ax_arr < u + s)
+                if valid is None:
+                    valid = cond
+                else:
+                    valid &= cond
+
+            if valid is not None and not valid.all():
+                multi = tuple(m[valid] for m in multi)
+                delta_vals = delta_vals[valid]
+            valid = None  # free
+
+            # ---- Step 3: compute linear systematic index from extra axes ----
+            if len(extra_positions) == 1:
+                ax_pos = extra_positions[0]
+                u = SparseHist._underflow_offset(h.axes[ax_pos])
+                if u == 0:
+                    syst_linear = multi[ax_pos].astype(np.int64, copy=False)
+                else:
+                    syst_linear = (multi[ax_pos] - u).astype(np.int64, copy=False)
+            else:
+                per = []
+                for ax_pos in extra_positions:
+                    u = SparseHist._underflow_offset(h.axes[ax_pos])
+                    per.append(multi[ax_pos] - u if u else multi[ax_pos])
+                syst_linear = np.ravel_multi_index(per, extra_sizes)
+
+            # ---- Step 4: compute channel flat index in target layout ----
+            if chan_flow:
+                chan_flat = np.ravel_multi_index(
+                    tuple(multi[i] for i in keep_positions), keep_extent
+                )
+            else:
+                chan_no_flow_multi = []
+                for ax_pos in keep_positions:
+                    u = SparseHist._underflow_offset(h.axes[ax_pos])
+                    chan_no_flow_multi.append(multi[ax_pos] - u if u else multi[ax_pos])
+                chan_flat = np.ravel_multi_index(chan_no_flow_multi, keep_no_flow)
+            multi = None  # free the per-axis arrays; we no longer need them
+
+            # ---- Step 5: look up norm at chan_flat; drop where norm == 0 ----
+            if norm_is_sparse:
+                norm_indices_arr = np.asarray(norm.indices, dtype=np.int64)
+                norm_data_arr = np.asarray(norm.data, dtype=np.float64)
+                positions = np.searchsorted(norm_indices_arr, chan_flat)
+                in_range = positions < len(norm_indices_arr)
+                match = np.zeros(len(chan_flat), dtype=bool)
+                match[in_range] = (
+                    norm_indices_arr[positions[in_range]] == chan_flat[in_range]
+                )
+                chan_flat = chan_flat[match]
+                delta_vals = delta_vals[match]
+                syst_linear = syst_linear[match]
+                norm_at_pos = norm_data_arr[positions[match]]
+            else:
+                norm_arr = np.asarray(norm, dtype=np.float64)
+                norm_at_pos = norm_arr[chan_flat]
+                nonzero_norm = norm_at_pos != 0.0
+                if not nonzero_norm.all():
+                    chan_flat = chan_flat[nonzero_norm]
+                    delta_vals = delta_vals[nonzero_norm]
+                    syst_linear = syst_linear[nonzero_norm]
+                    norm_at_pos = norm_at_pos[nonzero_norm]
+
+            # ---- Step 6: validate finiteness (mirrors get_logk's check) ----
+            if not np.all(np.isfinite(delta_vals)):
+                n_bad = int((~np.isfinite(delta_vals)).sum())
+                raise RuntimeError(
+                    f"{n_bad} NaN or Inf values encountered in systematic!"
+                )
+
+            # ---- Step 7: compute logk vectorized ----
+            syst_at_pos = norm_at_pos + delta_vals  # as_difference=True
+
+            if systematic_type == "log_normal":
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    logk_vals = kfactor * np.log(syst_at_pos / norm_at_pos)
+                logk_vals = np.where(
+                    np.equal(np.sign(norm_at_pos * syst_at_pos), 1),
+                    logk_vals,
+                    self.logkepsilon,
+                )
+                if self.clipSystVariations > 0.0:
+                    logk_vals = np.clip(logk_vals, -self.clip, self.clip)
+            elif systematic_type == "normal":
+                logk_vals = kfactor * (syst_at_pos - norm_at_pos)
+            else:
+                raise RuntimeError(
+                    f"Invalid systematic_type {systematic_type}, valid choices are 'log_normal' or 'normal'"
+                )
+
+            # ---- Step 8: drop exactly-zero logk entries ----
+            nonzero_logk = logk_vals != 0.0
+            if not nonzero_logk.all():
+                chan_flat = chan_flat[nonzero_logk]
+                logk_vals = logk_vals[nonzero_logk]
+                syst_linear = syst_linear[nonzero_logk]
+
+            # ---- Step 9: sort by linear syst index for partitioning ----
+            # Use the default (non-stable) quicksort since the intra-syst
+            # order does not affect correctness.
+            sort_order = np.argsort(syst_linear)
+            sorted_syst = syst_linear[sort_order]
+            sorted_chan_flat = chan_flat[sort_order]
+            sorted_logk = logk_vals[sort_order]
+            sort_order = None
+            syst_linear = None
+            chan_flat = None
+            logk_vals = None
+
+            # ---- Step 10: per-syst boundaries via searchsorted ----
+            boundaries = np.searchsorted(
+                sorted_syst, np.arange(n_total_systs + 1), side="left"
+            )
+            sorted_syst = None
+        else:
+            boundaries = np.zeros(n_total_systs + 1, dtype=np.int64)
+            sorted_chan_flat = np.empty(0, dtype=np.int64)
+            sorted_logk = np.empty(0, dtype=np.float64)
+
+        # ---- Step 11: bulk insert into the writer's internal storage ----
+        dict_logk_proc = self.dict_logkavg[channel][process]
+        if self.sparse:
+            dict_logk_idx_proc = self.dict_logkavg_indices[channel][process]
+
+        # Pre-compute per-axis label lists once (much faster than calling
+        # the generic _bin_label helper per combination, since the value()
+        # method on boost_histogram axes has non-trivial per-call overhead).
+        def _axis_labels(ax):
+            # Check whether the axis stores string categories; if so, decode
+            # them in bulk. Otherwise fall back to integer bin indices.
+            n = int(len(ax))
+            if n == 0:
+                return []
+            try:
+                v0 = ax.value(0)
+            except Exception:
+                v0 = None
+            if isinstance(v0, (str, bytes)):
+                out = []
+                for i in range(n):
+                    v = ax.value(i)
+                    if isinstance(v, bytes):
+                        v = v.decode()
+                    out.append(v)
+                return out
+            return [str(i) for i in range(n)]
+
+        axis_label_lists = [_axis_labels(ax) for ax in extra_axes]
+
+        if len(extra_axes) == 1:
+            labels0 = axis_label_lists[0]
+            sub_names = [f"{name}_{labels0[i]}" for i in range(extra_sizes[0])]
+        else:
+            sub_names = []
+            for linear_idx in range(n_total_systs):
+                multi_syst = np.unravel_index(linear_idx, extra_sizes)
+                labels = [
+                    axis_label_lists[k][int(multi_syst[k])]
+                    for k in range(len(extra_axes))
+                ]
+                sub_names.append("_".join([name, *labels]))
+
+        for linear_idx in range(n_total_systs):
+            sub_name = sub_names[linear_idx]
+            s = int(boundaries[linear_idx])
+            e = int(boundaries[linear_idx + 1])
+
+            if self.sparse:
+                # Sparse storage: store views into the sorted buffers (they
+                # keep the big arrays alive, but that is fine — we need the
+                # data anyway and sharing storage avoids a full per-syst copy).
+                dict_logk_idx_proc[sub_name] = sorted_chan_flat[s:e].reshape(-1, 1)
+                dict_logk_proc[sub_name] = sorted_logk[s:e]
+            else:
+                # Dense storage: scatter into a full-size logk array
+                logk_dense = np.zeros(target_size, dtype=np.float64)
+                if e > s:
+                    logk_dense[sorted_chan_flat[s:e]] = sorted_logk[s:e]
+                dict_logk_proc[sub_name] = logk_dense
+
+            self.book_systematic(sub_name, **kargs)
+
     def add_systematic(
         self,
         h,
@@ -825,6 +1140,36 @@ class TensorWriter:
                    systematic with name "{name}_{label_0}_{label_1}_...". Pass an empty list
                    to disable auto-detection.
         """
+
+        # Fast batched path for SparseHist multi-systematic input. Conditions:
+        #   - extra (systematic) axes are present
+        #   - input is a single SparseHist (not an asymmetric pair)
+        #   - mirror=True (single-hist symmetric input)
+        #   - as_difference=True (so missing entries cleanly mean "no variation"
+        #     for both log_normal and normal systematic types)
+        #   - not added to the data covariance (which goes through a different
+        #     bookkeeping path)
+        extra_info = self._detect_extra_syst_axes(h, channel, syst_axes)
+        if (
+            extra_info is not None
+            and not extra_info[1]  # is_pair
+            and isinstance(extra_info[0], SparseHist)
+            and mirror
+            and as_difference
+            and not add_to_data_covariance
+        ):
+            _, _, extra_axis_names = extra_info
+            self._add_systematics_sparsehist_batched(
+                h,
+                name,
+                process,
+                channel,
+                kfactor=kfactor,
+                as_difference=as_difference,
+                extra_axis_names=extra_axis_names,
+                **kargs,
+            )
+            return
 
         # multi-systematic dispatch: if h has extra axes beyond the channel,
         # iterate over those and book each combination as an independent systematic
@@ -1069,15 +1414,17 @@ class TensorWriter:
                 params = hess_params0
 
             if isinstance(hess, SparseHist):
-                # extract sparse coordinates and values from with-flow layout
-                # (StrCategory axes never have flow, so this matches the no-flow layout)
-                csr = hess.to_flat_csr(self.dtype, flow=False)
-                # csr has shape (1, n*n); convert flat positions to (row, col)
+                # Access the SparseHist's internal flat (indices, values)
+                # buffers directly. Going through ``to_flat_csr`` would do an
+                # O(nnz log nnz) sort that we don't need here, since the
+                # downstream representation is unordered (rows, cols, values).
+                # The flat indices live in the with-flow layout of the dense
+                # shape, but for StrCategory axes with overflow=False the
+                # extents equal the sizes so there are no flow bins to drop.
                 n = len(params)
-                flat = np.asarray(csr.indices, dtype=np.int64)
-                rows = (flat // n).astype(np.int64)
-                cols = (flat % n).astype(np.int64)
-                vals = np.asarray(csr.data, dtype=self.dtype)
+                flat = np.asarray(hess._flat_indices, dtype=np.int64)
+                vals = np.asarray(hess._values, dtype=self.dtype)
+                rows, cols = np.divmod(flat, n)
                 hess_sparse = (rows, cols, vals)
             elif self._issparse(hess):
                 raise ValueError(
@@ -1322,14 +1669,46 @@ class TensorWriter:
         ibin = 0
         if self.sparse:
             logger.info(f"Write out sparse array")
-            norm_sparse_size = 0
-            norm_sparse_indices = np.zeros([norm_sparse_size, 2], self.idxdtype)
-            norm_sparse_values = np.zeros([norm_sparse_size], self.dtype)
 
+            # Pre-compute total sizes so we can allocate the assembly buffers
+            # once instead of growing them per (channel, process, syst) which
+            # is O(N^2) total via np.ndarray.resize. This pass only touches
+            # python dict structures and is essentially free.
+            norm_sparse_size_total = 0
+            logk_sparse_size_total = 0
+            for chan_pre in self.channels.keys():
+                dict_norm_chan_pre = self.dict_norm[chan_pre]
+                dict_logkavg_chan_idx_pre = self.dict_logkavg_indices[chan_pre]
+                dict_logkhalfdiff_chan_idx_pre = self.dict_logkhalfdiff_indices[
+                    chan_pre
+                ]
+                for proc_pre in procs:
+                    if proc_pre not in dict_norm_chan_pre:
+                        continue
+                    norm_proc_pre = dict_norm_chan_pre[proc_pre]
+                    if self._issparse(norm_proc_pre):
+                        norm_sparse_size_total += int(len(norm_proc_pre.indices))
+                    else:
+                        norm_sparse_size_total += int(np.count_nonzero(norm_proc_pre))
+                    proc_logk_idx_pre = dict_logkavg_chan_idx_pre[proc_pre]
+                    for syst_idx_arr in proc_logk_idx_pre.values():
+                        logk_sparse_size_total += int(syst_idx_arr.shape[0])
+                    proc_halfdiff_idx_pre = dict_logkhalfdiff_chan_idx_pre[proc_pre]
+                    for syst_idx_arr in proc_halfdiff_idx_pre.values():
+                        logk_sparse_size_total += int(syst_idx_arr.shape[0])
+
+            norm_sparse_indices = np.empty([norm_sparse_size_total, 2], self.idxdtype)
+            norm_sparse_values = np.empty([norm_sparse_size_total], self.dtype)
+            logk_sparse_normindices = np.empty(
+                [logk_sparse_size_total, 1], self.idxdtype
+            )
+            logk_sparse_systindices = np.empty(
+                [logk_sparse_size_total, 1], self.idxdtype
+            )
+            logk_sparse_values = np.empty([logk_sparse_size_total], self.dtype)
+
+            norm_sparse_size = 0
             logk_sparse_size = 0
-            logk_sparse_normindices = np.zeros([logk_sparse_size, 1], self.idxdtype)
-            logk_sparse_systindices = np.zeros([logk_sparse_size, 1], self.idxdtype)
-            logk_sparse_values = np.zeros([logk_sparse_size], self.dtype)
 
             for chan in self.channels.keys():
                 nbinschan = self.nbinschan[chan]
@@ -1345,13 +1724,11 @@ class TensorWriter:
                     if self._issparse(norm_proc):
                         # Use scipy sparse structure directly
                         norm_indices = norm_proc.indices.reshape(-1, 1)
-                        norm_values = norm_proc.data.copy()
+                        norm_values = norm_proc.data
 
                         nvals = len(norm_values)
                         oldlength = norm_sparse_size
                         norm_sparse_size = oldlength + nvals
-                        norm_sparse_indices.resize([norm_sparse_size, 2])
-                        norm_sparse_values.resize([norm_sparse_size])
 
                         out_indices = np.array([[ibin, iproc]]) + np.pad(
                             norm_indices, ((0, 0), (0, 1)), "constant"
@@ -1374,8 +1751,6 @@ class TensorWriter:
                         nvals = len(norm_values)
                         oldlength = norm_sparse_size
                         norm_sparse_size = oldlength + nvals
-                        norm_sparse_indices.resize([norm_sparse_size, 2])
-                        norm_sparse_values.resize([norm_sparse_size])
 
                         out_indices = np.array([[ibin, iproc]]) + np.pad(
                             norm_indices, ((0, 0), (0, 1)), "constant"
@@ -1406,9 +1781,6 @@ class TensorWriter:
                         nvals_proc = len(logkavg_proc_values)
                         oldlength = logk_sparse_size
                         logk_sparse_size = oldlength + nvals_proc
-                        logk_sparse_normindices.resize([logk_sparse_size, 1])
-                        logk_sparse_systindices.resize([logk_sparse_size, 1])
-                        logk_sparse_values.resize([logk_sparse_size])
 
                         # first dimension of output indices are NOT in the dense [nbin,nproc] space, but rather refer to indices in the norm_sparse vectors
                         # second dimension is flattened in the [2,nsyst] space, where logkavg corresponds to [0,isyst] flattened to isyst
@@ -1446,9 +1818,6 @@ class TensorWriter:
                             nvals_proc = len(logkhalfdiff_proc_values)
                             oldlength = logk_sparse_size
                             logk_sparse_size = oldlength + nvals_proc
-                            logk_sparse_normindices.resize([logk_sparse_size, 1])
-                            logk_sparse_systindices.resize([logk_sparse_size, 1])
-                            logk_sparse_values.resize([logk_sparse_size])
 
                             # out_indices = np.array([[ibin,iproc,isyst,1]]) + np.pad(logkhalfdiff_proc_indices,((0,0),(0,3)),'constant')
                             # first dimension of output indices are NOT in the dense [nbin,nproc] space, but rather refer to indices in the norm_sparse vectors
@@ -1489,13 +1858,9 @@ class TensorWriter:
 
                 ibin += nbinschan
 
-            logger.info(f"Resize and sort sparse arrays into canonical order")
-            # resize sparse arrays to actual length
-            norm_sparse_indices.resize([norm_sparse_size, 2])
-            norm_sparse_values.resize([norm_sparse_size])
-            logk_sparse_normindices.resize([logk_sparse_size, 1])
-            logk_sparse_systindices.resize([logk_sparse_size, 1])
-            logk_sparse_values.resize([logk_sparse_size])
+            logger.info(f"Sort sparse arrays into canonical order")
+            assert norm_sparse_size == norm_sparse_size_total
+            assert logk_sparse_size == logk_sparse_size_total
 
             # straightforward sorting of norm_sparse into canonical order
             norm_sparse_dense_shape = (nbinsfull, nproc)
@@ -1845,29 +2210,30 @@ class TensorWriter:
     def get_constraintweights(self, dtype):
         systs = self.get_systs()
         constraintweights = np.ones([len(systs)], dtype=dtype)
+        syst_to_idx = {s: i for i, s in enumerate(systs)}
         for syst in self.get_systsnoconstraint():
-            constraintweights[systs.index(syst)] = 0.0
+            constraintweights[syst_to_idx[syst]] = 0.0
         return constraintweights
 
     def get_groups(self, group_dict):
         systs = self.get_systs()
+        # Pre-compute name -> index mapping once. The previous implementation
+        # called ``systs.index(syst)`` per group member which is O(len(systs))
+        # each, giving O(nsysts * nmembers) total -- prohibitive when both are
+        # large (e.g. ~108k corparms in a single group).
+        syst_to_idx = {s: i for i, s in enumerate(systs)}
         groups = []
         idxs = []
         for group, members in common.natural_sort_dict(group_dict).items():
             groups.append(group)
-            idx = []
-            for syst in members:
-                idx.append(systs.index(syst))
-            idxs.append(idx)
+            idxs.append([syst_to_idx[syst] for syst in members])
         return groups, idxs
 
     def get_noiidxs(self):
-        # list of indeces of nois w.r.t. systs
+        # list of indices of nois w.r.t. systs
         systs = self.get_systs()
-        idxs = []
-        for noi in self.get_systsnoi():
-            idxs.append(systs.index(noi))
-        return idxs
+        syst_to_idx = {s: i for i, s in enumerate(systs)}
+        return [syst_to_idx[noi] for noi in self.get_systsnoi()]
 
     def get_systgroups(self):
         # list of groups of systematics (nuisances) and lists of indexes
