@@ -573,6 +573,109 @@ class TensorWriter:
             pass
         return str(idx)
 
+    @staticmethod
+    def _make_empty_sparsehist(axes, size):
+        """Construct an empty SparseHist over ``axes`` with the given flat size."""
+        import scipy.sparse
+
+        empty_csr = scipy.sparse.csr_array(
+            (
+                np.zeros(0, dtype=np.float64),
+                np.zeros(0, dtype=np.int64),
+                np.array([0, 0], dtype=np.int64),
+            ),
+            shape=(1, int(size)),
+        )
+        return SparseHist(empty_csr, axes)
+
+    def _sparse_per_syst_slices(self, h, extra_axes, extra_axis_names, keep_axes):
+        """Yield ``(linear_idx, sub_h)`` for every bin combination on the extra axes.
+
+        Single-pass O(nnz log nnz) algorithm: extract all entries via the
+        with-flow flat layout, compute a linear syst index from the extra-axis
+        coordinates, sort once, then iterate contiguous per-bin runs. Empty
+        slots yield an empty SparseHist over the kept axes so that callers can
+        still book the corresponding systematic name (allowing it to be
+        constrained externally even when the template variation is exactly
+        zero).
+        """
+        import scipy.sparse
+
+        extra_sizes = [int(len(a)) for a in extra_axes]
+        n_total = int(np.prod(extra_sizes))
+        keep_extent = tuple(int(a.extent) for a in keep_axes)
+        keep_size = int(np.prod(keep_extent)) if keep_axes else 1
+
+        h_axis_names = [a.name for a in h.axes]
+        extra_positions = [h_axis_names.index(n) for n in extra_axis_names]
+        keep_positions = [
+            i for i in range(len(h_axis_names)) if i not in extra_positions
+        ]
+
+        csr = h.to_flat_csr(np.float64, flow=True)
+        flat_idx = np.asarray(csr.indices, dtype=np.int64)
+        values = np.asarray(csr.data, dtype=np.float64)
+
+        if len(flat_idx) == 0:
+            for linear_idx in range(n_total):
+                yield linear_idx, self._make_empty_sparsehist(keep_axes, keep_size)
+            return
+
+        multi = np.unravel_index(flat_idx, h.shape)
+
+        # Drop entries that fall in flow bins of any extra axis (we only
+        # iterate over the regular bins of those axes, matching the existing
+        # multi-systematic dispatch convention).
+        valid = np.ones(len(flat_idx), dtype=bool)
+        per_extra_idx = []
+        for ax_pos in extra_positions:
+            ax = h.axes[ax_pos]
+            u = SparseHist._underflow_offset(ax)
+            s = int(len(ax))
+            valid &= (multi[ax_pos] >= u) & (multi[ax_pos] < u + s)
+            per_extra_idx.append(multi[ax_pos] - u)
+
+        if not valid.all():
+            multi = tuple(m[valid] for m in multi)
+            values = values[valid]
+            per_extra_idx = [arr[valid] for arr in per_extra_idx]
+
+        if len(extra_positions) == 1:
+            syst_linear = per_extra_idx[0]
+        else:
+            syst_linear = np.ravel_multi_index(per_extra_idx, extra_sizes)
+
+        sort_order = np.argsort(syst_linear, kind="stable")
+        sorted_syst = syst_linear[sort_order]
+        sorted_values = values[sort_order]
+        sorted_keep_multi = tuple(multi[i][sort_order] for i in keep_positions)
+
+        boundaries = np.searchsorted(sorted_syst, np.arange(n_total + 1), side="left")
+
+        for linear_idx in range(n_total):
+            start = int(boundaries[linear_idx])
+            end = int(boundaries[linear_idx + 1])
+            if start == end:
+                yield linear_idx, self._make_empty_sparsehist(keep_axes, keep_size)
+                continue
+
+            sub_keep_multi = tuple(arr[start:end] for arr in sorted_keep_multi)
+            if len(keep_extent) == 1:
+                sub_flat = sub_keep_multi[0]
+            else:
+                sub_flat = np.ravel_multi_index(sub_keep_multi, keep_extent)
+            sub_vals = sorted_values[start:end]
+            order = np.argsort(sub_flat)
+            sub_csr = scipy.sparse.csr_array(
+                (
+                    sub_vals[order].astype(np.float64),
+                    sub_flat[order].astype(np.int64),
+                    np.array([0, len(sub_vals)], dtype=np.int64),
+                ),
+                shape=(1, keep_size),
+            )
+            yield linear_idx, SparseHist(sub_csr, keep_axes)
+
     def _get_systematic_slices(self, h, name, channel, syst_axes=None):
         """Detect extra axes in h beyond the channel and return list of (sub_name, sub_h) slices.
 
@@ -580,6 +683,15 @@ class TensorWriter:
 
         h may be a single histogram or a list/tuple of two (up/down) histograms.
         Both elements of a pair must share the same extra-axis structure.
+
+        For ``SparseHist`` inputs, an efficient single-pass algorithm is used
+        that pre-extracts the underlying flat representation, partitions
+        entries by their extra-axis indices via a global sort, and then yields
+        one sub-``SparseHist`` per bin combination on the extra axes. This is
+        O(nnz log nnz) total instead of O(nnz) per slice, and it always emits
+        a (possibly empty) sub-hist for *every* combination so that the
+        downstream booking sees all systematic names even where the
+        per-bin variation is identically zero.
 
         syst_axes:
           - None (default): auto-detect any axes in h not present in the channel
@@ -622,7 +734,56 @@ class TensorWriter:
 
         extra_axes = [h_ref.axes[n] for n in extra_axis_names]
         extra_sizes = [len(a) for a in extra_axes]
+        keep_axes_ref = [a for a in h_ref.axes if a.name not in extra_axis_names]
 
+        # Fast path for SparseHist inputs (the slow per-slice loop below would
+        # be O(nnz) per slice, which is prohibitive for large syst axes).
+        if isinstance(h_ref, SparseHist):
+            if is_pair:
+                if not isinstance(h[1], SparseHist):
+                    raise TypeError(
+                        "Mixed SparseHist/non-SparseHist pair not supported"
+                    )
+                up_iter = self._sparse_per_syst_slices(
+                    h[0], extra_axes, extra_axis_names, keep_axes_ref
+                )
+                dn_iter = self._sparse_per_syst_slices(
+                    h[1], extra_axes, extra_axis_names, keep_axes_ref
+                )
+                paired = zip(up_iter, dn_iter)
+            else:
+                paired = (
+                    (item, None)
+                    for item in self._sparse_per_syst_slices(
+                        h, extra_axes, extra_axis_names, keep_axes_ref
+                    )
+                )
+
+            slices = []
+            for linear_idx in range(int(np.prod(extra_sizes))):
+                if is_pair:
+                    (lu, sub_up), (ld, sub_dn) = next(paired)
+                    assert lu == linear_idx and ld == linear_idx
+                    sub_h = [sub_up, sub_dn]
+                else:
+                    (li, sub), _ = next(paired)
+                    assert li == linear_idx
+                    sub_h = sub
+                # Decode the extra-axis multi-dim index for label construction
+                if len(extra_axes) == 1:
+                    idx_tuple = (linear_idx,)
+                else:
+                    idx_tuple = tuple(
+                        int(x) for x in np.unravel_index(linear_idx, extra_sizes)
+                    )
+                labels = [
+                    self._bin_label(ax, i) for ax, i in zip(extra_axes, idx_tuple)
+                ]
+                sub_name = "_".join([name, *labels])
+                slices.append((sub_name, sub_h))
+            return slices
+
+        # Generic path: hist-like object using its own __getitem__ slicing.
         import itertools
 
         slices = []
