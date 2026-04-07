@@ -1238,8 +1238,13 @@ class Fitter:
 
         return expvars
 
-    def _compute_yields_noBBB(self, full=True):
+    def _compute_yields_noBBB(self, full=True, compute_norm=True):
         # full: compute yields inclduing masked channels
+        # compute_norm: also build the dense [nbins, nproc] normcentral tensor.
+        # In sparse mode this is expensive (forward + backward) and is only
+        # needed when an external caller requests per-process yields, or for
+        # binByBinStat in "full" mode. The default is True for backward
+        # compatibility; the NLL/grad/HVP path passes compute_norm=False.
         poi = self.get_poi()
         theta = self.get_theta()
 
@@ -1263,32 +1268,106 @@ class Fitter:
             mthetaalpha = tf.reshape(mthetaalpha, [2 * self.indata.nsyst, 1])
 
         if self.indata.sparse:
-            logsnorm = tf.sparse.sparse_dense_matmul(self.indata.logk, mthetaalpha)
-            logsnorm = tf.squeeze(logsnorm, -1)
+            # Inner contraction logk · mthetaalpha:
+            # equivalent to tf.sparse.sparse_dense_matmul(self.indata.logk, mthetaalpha)
+            # followed by squeeze, but expressed as gather + unsorted_segment_sum
+            # so that no dense [nrows, 1] intermediate is materialized and the
+            # contraction stays sparse end-to-end. logk.indices is sorted at
+            # load time via tf.sparse.reorder; unsorted_segment_sum is used
+            # rather than segment_sum because XLA (used with --jitCompile) has
+            # no SegmentSum kernel.
+            logk_indices = self.indata.logk.indices
+            logk_values = self.indata.logk.values
+            mthetaalpha_flat = tf.squeeze(mthetaalpha, -1)
+            contrib = logk_values * tf.gather(mthetaalpha_flat, logk_indices[:, 1])
+            logsnorm = tf.math.unsorted_segment_sum(
+                contrib,
+                logk_indices[:, 0],
+                num_segments=self.indata.logk.dense_shape[0],
+            )
 
-            if self.indata.systematic_type == "log_normal":
-                snorm = tf.exp(logsnorm)
-                snormnorm_sparse = self.indata.norm.with_values(
-                    snorm * self.indata.norm.values
+            if compute_norm:
+                # Slow path: caller actually wants the dense [nbins, nproc]
+                # tensor. Build snormnorm_sparse and densify, as before.
+                if self.indata.systematic_type == "log_normal":
+                    snorm = tf.exp(logsnorm)
+                    snormnorm_sparse = self.indata.norm.with_values(
+                        snorm * self.indata.norm.values
+                    )
+                elif self.indata.systematic_type == "normal":
+                    snormnorm_sparse = self.indata.norm * rnorm
+                    snormnorm_sparse = snormnorm_sparse.with_values(
+                        snormnorm_sparse.values + logsnorm
+                    )
+
+                if not full and self.indata.nbinsmasked:
+                    snormnorm_sparse = tfh.simple_sparse_slice0end(
+                        snormnorm_sparse, self.indata.nbins
+                    )
+
+                if self.indata.systematic_type == "log_normal":
+                    snormnorm = tf.sparse.to_dense(snormnorm_sparse)
+                    normcentral = rnorm * snormnorm
+                elif self.indata.systematic_type == "normal":
+                    normcentral = tf.sparse.to_dense(snormnorm_sparse)
+                nexpcentral = tf.reduce_sum(normcentral, axis=-1)
+            else:
+                # Fast path used by the NLL / gradient / HVP: compute
+                # per-nonzero-entry final values directly via gathers, then
+                # reduce to per-bin yields with one unsorted_segment_sum.
+                # No SparseTensor / SparseDenseCwiseMul / sparse_to_dense is
+                # used (those have no XLA kernels), and no dense
+                # [nbinsfull, nproc] intermediate is materialized in either
+                # the forward or the backward graph.
+                norm_indices = self.indata.norm.indices
+                norm_values = self.indata.norm.values
+                bin_idx_full = norm_indices[:, 0]
+                proc_idx_full = norm_indices[:, 1]
+
+                # rnorm has shape [1, nproc] or [nbinsfull, 1] depending on
+                # the POI model. Reshape to a flat dense tensor that we can
+                # gather from per-entry by either bin or proc index.
+                rnorm_shape = rnorm.shape
+                if rnorm_shape[0] == 1:
+                    # broadcast over bins; index by proc
+                    rnorm_per_entry = tf.gather(tf.reshape(rnorm, [-1]), proc_idx_full)
+                elif rnorm_shape[1] == 1:
+                    # broadcast over procs; index by bin
+                    rnorm_per_entry = tf.gather(tf.reshape(rnorm, [-1]), bin_idx_full)
+                else:
+                    # general [nbinsfull, nproc] rnorm: gather flat
+                    rnorm_flat = tf.reshape(rnorm, [-1])
+                    nproc = tf.cast(self.indata.nproc, bin_idx_full.dtype)
+                    rnorm_per_entry = tf.gather(
+                        rnorm_flat, bin_idx_full * nproc + proc_idx_full
+                    )
+
+                # logsnorm is per-row of the sparse tensor (one entry per
+                # nonzero of norm), so it can be used directly as a
+                # per-entry value.
+                if self.indata.systematic_type == "log_normal":
+                    final_values = norm_values * tf.exp(logsnorm) * rnorm_per_entry
+                else:  # "normal"
+                    final_values = norm_values * rnorm_per_entry + logsnorm
+
+                # Always reduce into the full nbinsfull range (XLA-friendly:
+                # static segment count, no boolean_mask), then slice the
+                # leading nbins entries when masked bins are not requested.
+                # The masked-bin segments are computed but immediately
+                # discarded — cheap because they are a small fraction.
+                nbinsfull_int = int(self.indata.nbinsfull)
+                # num_segments must be a Python int (not a tf.constant) so
+                # that unsorted_segment_sum yields a statically-shaped output;
+                # this is required for downstream code that does
+                # `array[: nexp.shape[0]]` and also avoids ForwardAccumulator
+                # tracing issues with tf.ensure_shape on dynamic shapes.
+                nexp_full = tf.math.unsorted_segment_sum(
+                    final_values, bin_idx_full, num_segments=nbinsfull_int
                 )
-            elif self.indata.systematic_type == "normal":
-                snormnorm_sparse = self.indata.norm * rnorm
-                snormnorm_sparse = snormnorm_sparse.with_values(
-                    snormnorm_sparse.values + logsnorm
-                )
-
-            if not full and self.indata.nbinsmasked:
-                snormnorm_sparse = tfh.simple_sparse_slice0end(
-                    snormnorm_sparse, self.indata.nbins
-                )
-
-            if self.indata.systematic_type == "log_normal":
-                snormnorm = tf.sparse.to_dense(snormnorm_sparse)
-                normcentral = rnorm * snormnorm
-            elif self.indata.systematic_type == "normal":
-                normcentral = tf.sparse.to_dense(snormnorm_sparse)
-
-            nexpcentral = tf.reduce_sum(normcentral, axis=-1)
+                if not full and self.indata.nbinsmasked:
+                    nexpcentral = nexp_full[: self.indata.nbins]
+                else:
+                    nexpcentral = nexp_full
         else:
             if full or self.indata.nbinsmasked == 0:
                 nbins = self.indata.nbinsfull
@@ -1325,7 +1404,13 @@ class Fitter:
         return nexpcentral, normcentral
 
     def _compute_yields_with_beta(self, profile=True, compute_norm=False, full=True):
-        nexp, norm = self._compute_yields_noBBB(full=full)
+        # Only materialize the dense [nbins, nproc] normcentral when an external
+        # caller requested it, or when binByBinStat "full" mode needs per-process
+        # yields for the analytic beta solution.
+        need_norm = compute_norm or (
+            self.binByBinStat and self.binByBinStatMode == "full"
+        )
+        nexp, norm = self._compute_yields_noBBB(full=full, compute_norm=need_norm)
 
         if self.binByBinStat:
             if profile:
@@ -1999,7 +2084,7 @@ class Fitter:
 
     @tf.function
     def _expected_yield_noBBB(self, full=False):
-        res, _ = self._compute_yields_noBBB(full=full)
+        res, _ = self._compute_yields_noBBB(full=full, compute_norm=False)
         return res
 
     @tf.function
