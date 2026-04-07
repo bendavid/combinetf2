@@ -60,6 +60,19 @@ class TensorWriter:
 
         self.has_beta_variations = False
 
+        # External likelihood terms. Each term is a dict with keys:
+        #   name: identifier
+        #   params: 1D ndarray of parameter name strings; both grad and hess
+        #     refer to this same parameter list in the same order
+        #   grad_values: 1D float ndarray (length == len(params)) or None
+        #   hess_dense: 2D float ndarray of shape (len(params), len(params)) or None
+        #   hess_sparse: tuple (rows, cols, values) for sparse hessian or None
+        # Exactly one of hess_dense / hess_sparse may be set, or neither
+        # (gradient-only term). Parameter names are resolved against the full
+        # fit parameter list (POIs + systs) at fit time. See
+        # add_external_likelihood_term for details.
+        self.external_terms = []
+
         self.clipSystVariations = False
         if self.clipSystVariations > 0.0:
             self.clip = np.abs(np.log(self.clipSystVariations))
@@ -798,6 +811,137 @@ class TensorWriter:
         self.has_beta_variations = True
 
     @staticmethod
+    def _strcategory_labels(ax):
+        """Return the bin labels of a hist StrCategory axis as a numpy string array.
+
+        Raises if ``ax`` is not a StrCategory axis.
+        """
+        import hist as _hist
+
+        if not isinstance(ax, _hist.axis.StrCategory):
+            raise TypeError(
+                f"External term axes must be hist.axis.StrCategory; got {type(ax).__name__}"
+            )
+        return np.array([ax.value(i) for i in range(len(ax))], dtype=object)
+
+    def add_external_likelihood_term(self, grad=None, hess=None, name=None):
+        """Add an additive quadratic term to the negative log-likelihood.
+
+        The term has the form
+
+            L_ext(x) = g^T x_sub + 0.5 * x_sub^T H x_sub
+
+        where ``x_sub`` is the slice of the full fit parameter vector
+        corresponding to the parameters identified by the StrCategory axes
+        of ``grad`` / ``hess``. Both ``grad`` and ``hess`` must use the same
+        parameter list in the same order. The parameter names are stored as
+        strings and resolved against the full parameter list (POIs + systs)
+        at fit time.
+
+        Parameters
+        ----------
+        grad : hist.Hist, optional
+            1D histogram with one ``hist.axis.StrCategory`` axis whose bin
+            labels are parameter names. Values are the gradient ``g``.
+        hess : hist.Hist or wums.SparseHist, optional
+            2D histogram with two ``hist.axis.StrCategory`` axes; both must
+            have identical bin labels equal to the gradient parameter list
+            (if ``grad`` is also given). Values are the hessian ``H``. May
+            be a dense ``hist.Hist`` or a ``wums.SparseHist`` for sparse
+            storage. ``H`` should be symmetric (the formula is
+            ``0.5 x^T H x``); the user is responsible for symmetrizing.
+        name : str, optional
+            Identifier for this term. Auto-generated if not provided.
+            Multiple terms can be added by calling this method repeatedly.
+        """
+        if grad is None and hess is None:
+            raise ValueError(
+                "add_external_likelihood_term requires at least one of grad or hess"
+            )
+
+        if name is None:
+            name = f"ext{len(self.external_terms)}"
+        if any(t["name"] == name for t in self.external_terms):
+            raise RuntimeError(f"External likelihood term '{name}' already added")
+
+        params = None
+
+        # Process gradient
+        grad_values = None
+        if grad is not None:
+            if not hasattr(grad, "axes") or len(grad.axes) != 1:
+                raise ValueError(
+                    f"grad must be a 1D histogram, got {type(grad).__name__} with "
+                    f"{len(grad.axes) if hasattr(grad, 'axes') else 0} axes"
+                )
+            grad_params = self._strcategory_labels(grad.axes[0])
+            grad_values = np.asarray(grad.values()).flatten().astype(self.dtype)
+            if len(grad_values) != len(grad_params):
+                raise RuntimeError(
+                    f"grad values length {len(grad_values)} does not match params length {len(grad_params)}"
+                )
+            params = grad_params
+
+        # Process hessian
+        hess_dense = None
+        hess_sparse = None
+        if hess is not None:
+            if len(hess.axes) != 2:
+                raise ValueError(
+                    f"hess must be a 2D histogram, got {len(hess.axes)} axes"
+                )
+            hess_params0 = self._strcategory_labels(hess.axes[0])
+            hess_params1 = self._strcategory_labels(hess.axes[1])
+            if not np.array_equal(hess_params0, hess_params1):
+                raise ValueError(
+                    "hess must have identical labels on both axes (since it is "
+                    "indexed by the same parameter list)"
+                )
+            if params is not None:
+                if not np.array_equal(params, hess_params0):
+                    raise ValueError(
+                        "grad and hess must use the same parameter list in the "
+                        f"same order; got grad params {params.tolist()} vs "
+                        f"hess params {hess_params0.tolist()}"
+                    )
+            else:
+                params = hess_params0
+
+            if isinstance(hess, SparseHist):
+                # extract sparse coordinates and values from with-flow layout
+                # (StrCategory axes never have flow, so this matches the no-flow layout)
+                csr = hess.to_flat_csr(self.dtype, flow=False)
+                # csr has shape (1, n*n); convert flat positions to (row, col)
+                n = len(params)
+                flat = np.asarray(csr.indices, dtype=np.int64)
+                rows = (flat // n).astype(np.int64)
+                cols = (flat % n).astype(np.int64)
+                vals = np.asarray(csr.data, dtype=self.dtype)
+                hess_sparse = (rows, cols, vals)
+            elif self._issparse(hess):
+                raise ValueError(
+                    "raw scipy sparse hess inputs are not supported; "
+                    "wrap in wums.SparseHist with the parameter axes attached"
+                )
+            else:
+                hess_dense = np.asarray(hess.values()).astype(self.dtype)
+                if hess_dense.shape != (len(params), len(params)):
+                    raise RuntimeError(
+                        f"hess shape {hess_dense.shape} does not match "
+                        f"params length {len(params)}"
+                    )
+
+        self.external_terms.append(
+            {
+                "name": name,
+                "params": np.asarray(params),
+                "grad_values": grad_values,
+                "hess_dense": hess_dense,
+                "hess_sparse": hess_sparse,
+            }
+        )
+
+    @staticmethod
     def _sparse_values_at(sparse_csr, indices):
         """Extract values from a flat CSR array at the given flat indices.
 
@@ -1477,6 +1621,51 @@ class TensorWriter:
                     beta_variations, f, "hbetavariations", maxChunkBytes=self.chunkSize
                 )
                 beta_variations = None
+
+        # Write external likelihood terms
+        if self.external_terms:
+            ext_group = f.create_group("external_terms")
+            create_dataset(
+                "external_term_names",
+                [t["name"] for t in self.external_terms],
+            )
+            for term in self.external_terms:
+                term_group = ext_group.create_group(term["name"])
+                params_ds = term_group.create_dataset(
+                    "params",
+                    [len(term["params"])],
+                    dtype=h5py.special_dtype(vlen=str),
+                    compression="gzip",
+                )
+                params_ds[...] = [str(p) for p in term["params"]]
+
+                if term["grad_values"] is not None:
+                    nbytes += h5pyutils_write.writeFlatInChunks(
+                        term["grad_values"],
+                        term_group,
+                        "grad_values",
+                        maxChunkBytes=self.chunkSize,
+                    )
+
+                if term["hess_dense"] is not None:
+                    nbytes += h5pyutils_write.writeFlatInChunks(
+                        term["hess_dense"],
+                        term_group,
+                        "hess_dense",
+                        maxChunkBytes=self.chunkSize,
+                    )
+                elif term["hess_sparse"] is not None:
+                    rows, cols, vals = term["hess_sparse"]
+                    n = len(term["params"])
+                    indices = np.stack([rows, cols], axis=-1).astype(self.idxdtype)
+                    nbytes += h5pyutils_write.writeSparse(
+                        indices,
+                        vals.astype(self.dtype),
+                        (n, n),
+                        term_group,
+                        "hess_sparse",
+                        maxChunkBytes=self.chunkSize,
+                    )
 
         logger.info(f"Total raw bytes in arrays = {nbytes}")
 

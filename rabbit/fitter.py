@@ -318,6 +318,52 @@ class Fitter:
         # one common regularization strength parameter
         self.tau = tf.Variable(1.0, trainable=True, name="tau", dtype=tf.float64)
 
+        # External likelihood terms (additive g^T x + 0.5 x^T H x contributions
+        # to the NLL). Resolve parameter name strings against the full fit
+        # parameter list (POIs + systs).
+        self.external_terms = []
+        parms_str = self.parms.astype(str)
+        for term in self.indata.external_terms:
+            params = np.asarray(term["params"]).astype(str)
+            indices = np.empty(len(params), dtype=np.int64)
+            for i, p in enumerate(params):
+                matches = np.where(parms_str == p)[0]
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        f"External likelihood term '{term['name']}' parameter "
+                        f"'{p}' matched {len(matches)} entries in fit parameters"
+                    )
+                indices[i] = matches[0]
+            tf_indices = tf.constant(indices, dtype=tf.int64)
+
+            tf_grad = (
+                tf.constant(term["grad_values"], dtype=self.indata.dtype)
+                if term["grad_values"] is not None
+                else None
+            )
+
+            tf_hess_dense = None
+            tf_hess_sparse = None
+            if term["hess_dense"] is not None:
+                tf_hess_dense = tf.constant(term["hess_dense"], dtype=self.indata.dtype)
+            elif term["hess_sparse"] is not None:
+                rows, cols, vals = term["hess_sparse"]
+                tf_hess_sparse = (
+                    tf.constant(rows, dtype=tf.int64),
+                    tf.constant(cols, dtype=tf.int64),
+                    tf.constant(vals, dtype=self.indata.dtype),
+                )
+
+            self.external_terms.append(
+                {
+                    "name": term["name"],
+                    "indices": tf_indices,
+                    "grad": tf_grad,
+                    "hess_dense": tf_hess_dense,
+                    "hess_sparse": tf_hess_sparse,
+                }
+            )
+
         # constraint minima for nuisance parameters
         self.theta0 = tf.Variable(
             self.theta0default,
@@ -2087,6 +2133,27 @@ class Fitter:
 
         return ln, lc, lbeta, lpenalty, beta
 
+    def _compute_external_nll(self):
+        """Sum of external likelihood term contributions: sum_i (g_i^T x_sub + 0.5 x_sub^T H_i x_sub)."""
+        if not self.external_terms:
+            return None
+        total = tf.zeros([], dtype=self.indata.dtype)
+        for term in self.external_terms:
+            x_sub = tf.gather(self.x, term["indices"])
+            if term["grad"] is not None:
+                total = total + tf.reduce_sum(term["grad"] * x_sub)
+            if term["hess_dense"] is not None:
+                # 0.5 * x_sub^T H x_sub
+                total = total + 0.5 * tf.reduce_sum(
+                    x_sub * tf.linalg.matvec(term["hess_dense"], x_sub)
+                )
+            elif term["hess_sparse"] is not None:
+                rows, cols, vals = term["hess_sparse"]
+                total = total + 0.5 * tf.reduce_sum(
+                    vals * tf.gather(x_sub, rows) * tf.gather(x_sub, cols)
+                )
+        return total
+
     def _compute_nll(self, profile=True, full_nll=False):
         ln, lc, lbeta, lpenalty, beta = self._compute_nll_components(
             profile=profile, full_nll=full_nll
@@ -2098,6 +2165,10 @@ class Fitter:
 
         if lpenalty is not None:
             l = l + lpenalty
+
+        lext = self._compute_external_nll()
+        if lext is not None:
+            l = l + lext
         return l
 
     def _compute_loss(self, profile=True):

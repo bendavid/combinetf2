@@ -182,6 +182,59 @@ class FitInputData:
 
             self.axis_procs = hist.axis.StrCategory(self.procs, name="processes")
 
+            # Load external likelihood terms (optional).
+            # Each entry is a dict with keys:
+            #   name: str
+            #   params: 1D ndarray of parameter name strings
+            #   grad_values: 1D float ndarray or None
+            #   hess_dense: 2D float ndarray or None
+            #   hess_sparse: tuple (rows, cols, values) or None
+            self.external_terms = []
+            if "external_terms" in f.keys():
+                names = [
+                    s.decode() if isinstance(s, bytes) else s
+                    for s in f["hexternal_term_names"][...]
+                ]
+                ext_group = f["external_terms"]
+                for tname in names:
+                    tg = ext_group[tname]
+                    raw_params = tg["params"][...]
+                    params = np.array(
+                        [s.decode() if isinstance(s, bytes) else s for s in raw_params]
+                    )
+                    grad_values = (
+                        np.asarray(maketensor(tg["grad_values"]))
+                        if "grad_values" in tg.keys()
+                        else None
+                    )
+                    hess_dense = (
+                        np.asarray(maketensor(tg["hess_dense"]))
+                        if "hess_dense" in tg.keys()
+                        else None
+                    )
+                    hess_sparse = None
+                    if "hess_sparse" in tg.keys():
+                        hg = tg["hess_sparse"]
+                        idx_dset = hg["indices"]
+                        if "original_shape" in idx_dset.attrs:
+                            idx_shape = tuple(idx_dset.attrs["original_shape"])
+                            indices = np.asarray(idx_dset).reshape(idx_shape)
+                        else:
+                            indices = np.asarray(idx_dset)
+                        rows = indices[:, 0]
+                        cols = indices[:, 1]
+                        vals = np.asarray(hg["values"])
+                        hess_sparse = (rows, cols, vals)
+                    self.external_terms.append(
+                        {
+                            "name": tname,
+                            "params": params,
+                            "grad_values": grad_values,
+                            "hess_dense": hess_dense,
+                            "hess_sparse": hess_sparse,
+                        }
+                    )
+
     @tf.function
     def expected_events_nominal(self):
         rnorm = tf.ones(self.nproc, dtype=self.dtype)
