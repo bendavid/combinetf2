@@ -4,6 +4,7 @@ from collections import defaultdict
 
 import h5py
 import numpy as np
+from wums.sparse_hist import SparseHist  # noqa: F401  re-exported for convenience
 
 from rabbit import common, h5pyutils_write
 
@@ -77,11 +78,19 @@ class TensorWriter:
         return hasattr(h, "toarray") and hasattr(h, "tocoo")
 
     @staticmethod
-    def _sparse_to_flat_csr(h, dtype):
+    def _sparse_to_flat_csr(h, dtype, flow=False):
         """Flatten a scipy sparse array/matrix to CSR with shape (1, prod(shape)).
+
+        For SparseHist inputs, forwards ``flow`` to ``h.to_flat_csr`` so the
+        wrapper can convert from its internal with-flow layout to the requested
+        layout. For raw scipy sparse inputs, the row-major flatten of ``h.shape``
+        is used directly (the user is responsible for matching the channel layout).
 
         The returned CSR array has sorted indices suitable for searchsorted lookups.
         """
+        if hasattr(h, "to_flat_csr"):
+            return h.to_flat_csr(dtype, flow=flow)
+
         import scipy.sparse
 
         size = int(np.prod(h.shape))
@@ -102,8 +111,13 @@ class TensorWriter:
             (sorted_data, sorted_indices, indptr), shape=(1, size)
         )
 
-    def _to_flat_dense(self, h):
-        """Convert any array-like (including scipy sparse) to a flat dense numpy array."""
+    def _to_flat_dense(self, h, flow=False):
+        """Convert any array-like (including scipy sparse) to a flat dense numpy array.
+
+        For SparseHist inputs, ``flow`` selects the with-flow or no-flow layout.
+        """
+        if isinstance(h, SparseHist):
+            return np.asarray(h.toarray(flow=flow)).flatten().astype(self.dtype)
         if self._issparse(h):
             return np.asarray(h.toarray()).flatten().astype(self.dtype)
         return np.asarray(h).flatten().astype(self.dtype)
@@ -111,6 +125,8 @@ class TensorWriter:
     def get_flat_values(self, h, flow=False):
         if hasattr(h, "values"):
             values = h.values(flow=flow)
+        elif isinstance(h, SparseHist):
+            values = h.toarray(flow=flow)
         elif self._issparse(h):
             values = np.asarray(h.toarray())
         else:
@@ -120,6 +136,8 @@ class TensorWriter:
     def get_flat_variances(self, h, flow=False):
         if hasattr(h, "variances"):
             variances = h.variances(flow=flow)
+        elif isinstance(h, SparseHist):
+            variances = h.toarray(flow=flow)
         elif self._issparse(h):
             variances = np.asarray(h.toarray())
         else:
@@ -179,7 +197,7 @@ class TensorWriter:
 
         if self.sparse and self._issparse(h):
             # Store as flat CSR, avoiding full dense conversion
-            norm = self._sparse_to_flat_csr(h, self.dtype)
+            norm = self._sparse_to_flat_csr(h, self.dtype, flow=flow)
             if not np.all(np.isfinite(norm.data)):
                 raise RuntimeError(
                     f"NaN or Inf values encountered in nominal histogram for {name}!"
@@ -203,7 +221,7 @@ class TensorWriter:
         if variances is not None:
             sumw2 = self.get_flat_variances(variances, flow)
         elif self._issparse(h):
-            sumw2 = self._to_flat_dense(h)
+            sumw2 = self._to_flat_dense(h, flow=flow)
         else:
             sumw2 = self.get_flat_variances(h, flow)
 
@@ -531,6 +549,85 @@ class TensorWriter:
             var_name_out, add_to_data_covariance=add_to_data_covariance, **kargs
         )
 
+    @staticmethod
+    def _bin_label(ax, idx):
+        """Return a string label for a hist axis bin, preferring string values."""
+        try:
+            v = ax.value(idx)
+            if isinstance(v, (str, bytes)):
+                return v.decode() if isinstance(v, bytes) else v
+        except Exception:
+            pass
+        return str(idx)
+
+    def _get_systematic_slices(self, h, name, channel, syst_axes=None):
+        """Detect extra axes in h beyond the channel and return list of (sub_name, sub_h) slices.
+
+        Returns None if there are no extra axes (i.e. single-systematic case).
+
+        h may be a single histogram or a list/tuple of two (up/down) histograms.
+        Both elements of a pair must share the same extra-axis structure.
+
+        syst_axes:
+          - None (default): auto-detect any axes in h not present in the channel
+          - list of axis names: use exactly these axes as systematic axes
+          - empty list: disable detection entirely
+        """
+        if syst_axes is not None and len(syst_axes) == 0:
+            return None
+
+        if isinstance(h, (list, tuple)):
+            h_ref = h[0]
+            is_pair = True
+        else:
+            h_ref = h
+            is_pair = False
+
+        # only hist-like objects (with .axes) support multi-systematic
+        if not hasattr(h_ref, "axes"):
+            return None
+
+        h_axis_names = [a.name for a in h_ref.axes]
+        channel_axis_names = [a.name for a in self.channels[channel]["axes"]]
+
+        if syst_axes is None:
+            extra_axis_names = [n for n in h_axis_names if n not in channel_axis_names]
+        else:
+            for n in syst_axes:
+                if n not in h_axis_names:
+                    raise RuntimeError(
+                        f"Requested systematic axis '{n}' not found in histogram axes {h_axis_names}"
+                    )
+                if n in channel_axis_names:
+                    raise RuntimeError(
+                        f"Systematic axis '{n}' overlaps with channel axes {channel_axis_names}"
+                    )
+            extra_axis_names = list(syst_axes)
+
+        if not extra_axis_names:
+            return None
+
+        extra_axes = [h_ref.axes[n] for n in extra_axis_names]
+        extra_sizes = [len(a) for a in extra_axes]
+
+        import itertools
+
+        slices = []
+        for idx_tuple in itertools.product(*[range(s) for s in extra_sizes]):
+            labels = [self._bin_label(ax, i) for ax, i in zip(extra_axes, idx_tuple)]
+            sub_name = "_".join([name, *labels])
+
+            slice_dict = {n: i for n, i in zip(extra_axis_names, idx_tuple)}
+
+            if is_pair:
+                sub_h = [h[0][slice_dict], h[1][slice_dict]]
+            else:
+                sub_h = h[slice_dict]
+
+            slices.append((sub_name, sub_h))
+
+        return slices
+
     def add_systematic(
         self,
         h,
@@ -542,12 +639,38 @@ class TensorWriter:
         symmetrize="average",
         add_to_data_covariance=False,
         as_difference=False,
+        syst_axes=None,
         **kargs,
     ):
         """
         h: either a single histogram with the systematic variation if mirror=True or a list of two histograms with the up and down variation
         as_difference: if True, interpret the histogram values as the difference with respect to the nominal (i.e. the absolute variation is norm + h)
+        syst_axes: optional list of axis names in h that represent independent systematics.
+                   If None (default) and h is a hist-like object with axes beyond the channel,
+                   the extra axes are auto-detected and each bin combination becomes a separate
+                   systematic with name "{name}_{label_0}_{label_1}_...". Pass an empty list
+                   to disable auto-detection.
         """
+
+        # multi-systematic dispatch: if h has extra axes beyond the channel,
+        # iterate over those and book each combination as an independent systematic
+        slices = self._get_systematic_slices(h, name, channel, syst_axes)
+        if slices is not None:
+            for sub_name, sub_h in slices:
+                self.add_systematic(
+                    sub_h,
+                    sub_name,
+                    process,
+                    channel,
+                    kfactor=kfactor,
+                    mirror=mirror,
+                    symmetrize=symmetrize,
+                    add_to_data_covariance=add_to_data_covariance,
+                    as_difference=as_difference,
+                    syst_axes=[],
+                    **kargs,
+                )
+            return
 
         norm = self.dict_norm[channel][process]
 
@@ -692,7 +815,8 @@ class TensorWriter:
     def _get_syst_at_norm_nnz(self, h, norm_csr, flow):
         """Extract flat systematic values only at norm's nonzero positions.
 
-        h can be a histogram, scipy sparse, or dense array.
+        h can be a histogram, scipy sparse, SparseHist, or dense array.
+        ``flow`` controls the flat layout (must match the channel/norm layout).
         Returns a 1D dense array of length norm_csr.nnz.
         """
         nnz_idx = norm_csr.indices
@@ -700,7 +824,7 @@ class TensorWriter:
             values = h.values(flow=flow)
             return values.flatten().astype(self.dtype)[nnz_idx]
         elif self._issparse(h):
-            syst_csr = self._sparse_to_flat_csr(h, self.dtype)
+            syst_csr = self._sparse_to_flat_csr(h, self.dtype, flow=flow)
             return self._sparse_values_at(syst_csr, nnz_idx)
         else:
             return np.asarray(h).flatten().astype(self.dtype)[nnz_idx]
