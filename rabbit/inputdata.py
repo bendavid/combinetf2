@@ -85,13 +85,22 @@ class FitInputData:
                 self.norm = makesparsetensor(f["hnorm_sparse"])
                 self.logk = makesparsetensor(f["hlogk_sparse"])
                 # Canonicalize index ordering once at load time. The fitter's
-                # sparse fast path reduces nonzero entries with
-                # tf.math.unsorted_segment_sum keyed on the row index; sorted
-                # row-major indices give the kernel coalesced memory access
-                # and improve XLA fusion. tf.sparse.reorder sorts indices in
-                # row-major (lexicographic) order.
+                # sparse fast path reduces nonzero entries via row-keyed
+                # reductions; sorted row-major indices give coalesced memory
+                # access. tf.sparse.reorder sorts into row-major order.
                 self.norm = tf.sparse.reorder(self.norm)
                 self.logk = tf.sparse.reorder(self.logk)
+                # Pre-build a CSRSparseMatrix view of logk for use in the
+                # fitter's sparse matvec path via sm.matmul, which dispatches
+                # to a multi-threaded CSR kernel and is much faster per call
+                # than the equivalent gather + unsorted_segment_sum. NOTE:
+                # SparseMatrixMatMul has no XLA kernel, so any tf.function
+                # that calls sm.matmul must be built with jit_compile=False.
+                from tensorflow.python.ops.linalg.sparse import (
+                    sparse_csr_matrix_ops as _tf_sparse_csr,
+                )
+
+                self.logk_csr = _tf_sparse_csr.CSRSparseMatrix(self.logk)
             else:
                 self.norm = maketensor(f["hnorm"])
                 self.logk = maketensor(f["hlogk"])

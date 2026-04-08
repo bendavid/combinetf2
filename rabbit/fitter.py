@@ -7,6 +7,7 @@ import numpy as np
 import scipy
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow.python.ops.linalg.sparse import sparse_csr_matrix_ops as tf_sparse_csr
 from wums import logging
 
 from rabbit import io_tools
@@ -345,19 +346,17 @@ class Fitter:
             )
 
             tf_hess_dense = None
-            tf_hess_sparse_st = None
+            tf_hess_csr = None
             if term["hess_dense"] is not None:
                 tf_hess_dense = tf.constant(term["hess_dense"], dtype=self.indata.dtype)
             elif term["hess_sparse"] is not None:
-                # Build a tf.SparseTensor view of the stored upper-/lower-
-                # triangular Hessian for use in sparse_dense_matmul-based
-                # closed-form gradient/HVP. Sort indices into canonical
-                # row-major order so the kernel can do a single pass.
-                # Define A as the stored matrix (whatever its triangularity);
-                # the loss is L = 0.5 * x_sub^T A x_sub, and the gradient
-                # / HVP are 0.5 * (A + A^T) @ x_sub / p_sub. We compute
-                # (A^T @ v) via sparse_dense_matmul(..., adjoint_a=True),
-                # so only one copy of A's nnz is held.
+                # Build a CSRSparseMatrix view of the stored sparse Hessian
+                # for use in the closed-form external gradient/HVP path via
+                # sm.matmul. The Hessian is assumed symmetric so the loss
+                # L = 0.5 x_sub^T H x_sub has gradient H @ x_sub and HVP
+                # H @ p_sub, each a single sm.matmul call. NOTE:
+                # SparseMatrixMatMul has no XLA kernel, so any tf.function
+                # that calls sm.matmul must be built with jit_compile=False.
                 rows, cols, vals = term["hess_sparse"]
                 rows_np = np.asarray(rows, dtype=np.int64)
                 cols_np = np.asarray(cols, dtype=np.int64)
@@ -365,11 +364,12 @@ class Fitter:
                 n_sub = int(len(params))
                 order = np.lexsort((cols_np, rows_np))
                 indices_sorted = np.stack([rows_np[order], cols_np[order]], axis=1)
-                tf_hess_sparse_st = tf.SparseTensor(
+                hess_st = tf.SparseTensor(
                     indices=tf.constant(indices_sorted, dtype=tf.int64),
                     values=tf.constant(vals_np[order], dtype=self.indata.dtype),
                     dense_shape=tf.constant([n_sub, n_sub], dtype=tf.int64),
                 )
+                tf_hess_csr = tf_sparse_csr.CSRSparseMatrix(hess_st)
 
             self.external_terms.append(
                 {
@@ -377,7 +377,7 @@ class Fitter:
                     "indices": tf_indices,
                     "grad": tf_grad,
                     "hess_dense": tf_hess_dense,
-                    "hess_sparse_st": tf_hess_sparse_st,
+                    "hess_csr": tf_hess_csr,
                 }
             )
 
@@ -1301,22 +1301,16 @@ class Fitter:
             mthetaalpha = tf.reshape(mthetaalpha, [2 * self.indata.nsyst, 1])
 
         if self.indata.sparse:
-            # Inner contraction logk · mthetaalpha:
-            # equivalent to tf.sparse.sparse_dense_matmul(self.indata.logk, mthetaalpha)
-            # followed by squeeze, but expressed as gather + unsorted_segment_sum
-            # so that no dense [nrows, 1] intermediate is materialized and the
-            # contraction stays sparse end-to-end. logk.indices is sorted at
-            # load time via tf.sparse.reorder; unsorted_segment_sum is used
-            # rather than segment_sum because XLA (used with --jitCompile) has
-            # no SegmentSum kernel.
-            logk_indices = self.indata.logk.indices
-            logk_values = self.indata.logk.values
-            mthetaalpha_flat = tf.squeeze(mthetaalpha, -1)
-            contrib = logk_values * tf.gather(mthetaalpha_flat, logk_indices[:, 1])
-            logsnorm = tf.math.unsorted_segment_sum(
-                contrib,
-                logk_indices[:, 0],
-                num_segments=self.indata.logk.dense_shape[0],
+            # Inner contraction logk · mthetaalpha via tf.linalg.sparse's
+            # CSR matmul. This is ~8x faster per call than the equivalent
+            # gather + unsorted_segment_sum, because SparseMatrixMatMul
+            # dispatches to a hand-tuned CSR kernel that streams nnz in row
+            # order. NOTE: SparseMatrixMatMul has no XLA kernel, so the
+            # enclosing loss/grad/HVP tf.functions are built with
+            # jit_compile=False in sparse mode (see _make_tf_functions).
+            logsnorm = tf.squeeze(
+                tf_sparse_csr.matmul(self.indata.logk_csr, mthetaalpha),
+                axis=-1,
             )
 
             nbins_out_int = (
@@ -1390,17 +1384,13 @@ class Fitter:
                 else:  # "normal"
                     final_values = norm_values * rnorm_per_entry + logsnorm
 
-                # Always reduce into the full nbinsfull range (XLA-friendly:
-                # static segment count, no boolean_mask), then slice the
-                # leading nbins entries when masked bins are not requested.
-                # The masked-bin segments are computed but immediately
-                # discarded — cheap because they are a small fraction.
+                # Collapse per-entry contributions to per-bin yields. At
+                # this scale (~10^5 entries → ~10^5 bins) single-threaded
+                # unsorted_segment_sum beats the multi-threaded CSR matmul
+                # kernel — the CSR dispatch overhead dominates for small
+                # matrices. (Measured: switching this op to a CSR matvec
+                # was a 30% HVP regression on jpsi.)
                 nbinsfull_int = int(self.indata.nbinsfull)
-                # num_segments must be a Python int (not a tf.constant) so
-                # that unsorted_segment_sum yields a statically-shaped output;
-                # this is required for downstream code that does
-                # `array[: nexp.shape[0]]` and also avoids ForwardAccumulator
-                # tracing issues with tf.ensure_shape on dynamic shapes.
                 nexp_full = tf.math.unsorted_segment_sum(
                     final_values, bin_idx_full, num_segments=nbinsfull_int
                 )
@@ -2261,9 +2251,9 @@ class Fitter:
     def _compute_external_nll(self):
         """Sum of external likelihood term contributions: sum_i (g_i^T x_sub + 0.5 x_sub^T H_i x_sub).
 
-        For sparse-Hessian terms this uses tf.sparse.sparse_dense_matmul on a
-        canonically-sorted SparseTensor, avoiding the per-nnz gather/multiply
-        intermediates that the previous element-wise form materialized.
+        For sparse-Hessian terms this uses tf.linalg.sparse's CSR matmul
+        which dispatches to a multi-threaded kernel much faster than the
+        previous sparse_dense_matmul path.
         """
         if not self.external_terms:
             return None
@@ -2277,12 +2267,13 @@ class Fitter:
                 total = total + 0.5 * tf.reduce_sum(
                     x_sub * tf.linalg.matvec(term["hess_dense"], x_sub)
                 )
-            elif term["hess_sparse_st"] is not None:
-                # Loss = 0.5 * x_sub^T A x_sub, with A the stored sparse matrix.
-                Ax = tf.sparse.sparse_dense_matmul(
-                    term["hess_sparse_st"], x_sub[:, None]
-                )[:, 0]
-                total = total + 0.5 * tf.reduce_sum(x_sub * Ax)
+            elif term["hess_csr"] is not None:
+                # Loss = 0.5 * x_sub^T H x_sub via CSR matvec (H is symmetric).
+                Hx = tf.squeeze(
+                    tf_sparse_csr.matmul(term["hess_csr"], x_sub[:, None]),
+                    axis=-1,
+                )
+                total = total + 0.5 * tf.reduce_sum(x_sub * Hx)
         return total
 
     def _compute_nll(self, profile=True, full_nll=False, skip_external=False):
@@ -2359,20 +2350,21 @@ class Fitter:
                     p_sub = tf.gather(p, idx)
                     Hp = tf.linalg.matvec(term["hess_dense"], p_sub)
                     hvp = tf.tensor_scatter_nd_add(hvp, idx2d, Hp)
-            elif term["hess_sparse_st"] is not None:
-                # Sparse symmetric quadratic. The stored matrix H is full
-                # symmetric, so the loss is L = 0.5 x^T H x with gradient
-                # H @ x and HVP H @ p — one sparse matvec each, no per-nnz
-                # gather/multiply intermediates and no backward pass through
-                # autodiff. Only A's nnz are touched once per matvec.
-                H_sp = term["hess_sparse_st"]
-                Hx = tf.sparse.sparse_dense_matmul(H_sp, x_sub[:, None])[:, 0]
+            elif term["hess_csr"] is not None:
+                # Sparse symmetric quadratic. H is full symmetric, so the
+                # loss is L = 0.5 x^T H x with gradient H @ x and HVP H @ p,
+                # each a single CSR matvec via tf.linalg.sparse's multi-
+                # threaded SparseMatrixMatMul kernel.
+                H_csr = term["hess_csr"]
+                Hx = tf.squeeze(tf_sparse_csr.matmul(H_csr, x_sub[:, None]), axis=-1)
                 val = val + 0.5 * tf.reduce_sum(x_sub * Hx)
                 g_sub = g_sub + Hx
 
                 if p is not None:
                     p_sub = tf.gather(p, idx)
-                    Hp = tf.sparse.sparse_dense_matmul(H_sp, p_sub[:, None])[:, 0]
+                    Hp = tf.squeeze(
+                        tf_sparse_csr.matmul(H_csr, p_sub[:, None]), axis=-1
+                    )
                     hvp = tf.tensor_scatter_nd_add(hvp, idx2d, Hp)
 
             grad = tf.tensor_scatter_nd_add(grad, idx2d, g_sub)
@@ -2389,20 +2381,30 @@ class Fitter:
         #   * a separate, NOT-jit-compiled "external" tf.function that
         #     contributes the closed-form value/gradient/HVP for any
         #     external likelihood terms.
-        # The split is needed because the closed-form path uses
-        # tf.sparse.sparse_dense_matmul, which has no XLA kernel — including
-        # it inside the jit-compiled cluster fails to compile. The external
-        # part is small (one or two sparse matvecs), so leaving it unjitted
-        # is fine. Skipping the external contributions in the autodiff path
-        # also avoids rematerializing the expensive external-Hessian
+        # The split is needed when the autodiff core is jit-compiled and
+        # external terms exist: the closed-form external path uses
+        # tf.linalg.sparse's CSR matmul, which has no XLA kernel, so it
+        # cannot live inside a jit cluster. In sparse mode the core itself
+        # already uses the CSR matmul for the logk contraction, so its
+        # tf.function is built with jit_compile=False regardless, and the
+        # external contributions can then be merged back into the core.
+        #
+        # Skipping the external contributions in the autodiff path also
+        # avoids rematerializing the expensive external-Hessian
         # gather/scatter chain inside the nested second-order tape, which
         # was the dominant cost on large external-Hessian problems like the
         # jpsi calibration before this rewrite.
-        jit = self.jit_compile
         has_external = bool(self.external_terms)
-        # When external terms are present, the autodiff core skips them
-        # (we add them back from the closed-form path below).
-        skip_ext = has_external
+        # SparseMatrixMatMul has no XLA kernel, so any tf.function that
+        # uses it (either via _compute_yields_noBBB in sparse mode, or via
+        # _external_contributions) cannot be jit-compiled.
+        jit_for_core = self.jit_compile and not self.indata.sparse
+        # The external contribution is split out into a separate un-jitted
+        # tf.function only when the core is itself jit-compiled. Otherwise
+        # the core can include the external term directly.
+        use_ext_split = has_external and jit_for_core
+        skip_ext = use_ext_split
+        jit = jit_for_core
 
         def _core_val(self):
             return self._compute_loss(skip_external=skip_ext)
@@ -2459,8 +2461,10 @@ class Fitter:
 
         # Public wrappers: thin Python that runs the (possibly jit-compiled)
         # core and adds the external contributions, both as already-built
-        # tf.functions so each side gets cached / traced once.
-        if has_external:
+        # tf.functions so each side gets cached / traced once. When the
+        # external contribution is folded into the core (use_ext_split is
+        # False), the public wrappers are the cores directly.
+        if use_ext_split:
 
             def loss_val():
                 v = core_val()
@@ -2492,7 +2496,18 @@ class Fitter:
         self.loss_val_grad = loss_val_grad
         self.loss_val_grad_hessp_fwdrev = loss_val_grad_hessp_fwdrev
         self.loss_val_grad_hessp_revrev = loss_val_grad_hessp_revrev
-        if self.hvp_method == "fwdrev":
+        # tf.autodiff.ForwardAccumulator does not support tangent
+        # propagation through SparseMatrixMatMul (no JVP rule for the
+        # CSR variant), so the fwdrev HVP cannot be used in sparse mode.
+        # Fall back to revrev with a warning.
+        if self.hvp_method == "fwdrev" and self.indata.sparse:
+            logger.warning(
+                "fwdrev HVP is not supported in sparse mode "
+                "(tf.autodiff.ForwardAccumulator cannot trace through "
+                "tf.linalg.sparse's CSR matmul); falling back to revrev."
+            )
+            self.loss_val_grad_hessp = self.loss_val_grad_hessp_revrev
+        elif self.hvp_method == "fwdrev":
             self.loss_val_grad_hessp = self.loss_val_grad_hessp_fwdrev
         else:
             self.loss_val_grad_hessp = self.loss_val_grad_hessp_revrev
