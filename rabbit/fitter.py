@@ -1302,10 +1302,9 @@ class Fitter:
 
         if self.indata.sparse:
             # Inner contraction logk · mthetaalpha via tf.linalg.sparse's
-            # CSR matmul. This is ~8x faster per call than the equivalent
-            # gather + unsorted_segment_sum, because SparseMatrixMatMul
-            # dispatches to a hand-tuned CSR kernel that streams nnz in row
-            # order. NOTE: SparseMatrixMatMul has no XLA kernel, so the
+            # CSR matmul. ~8x faster per call than gather + segment_sum
+            # because SparseMatrixMatMul dispatches to a hand-tuned CSR
+            # kernel. NOTE: SparseMatrixMatMul has no XLA kernel, so the
             # enclosing loss/grad/HVP tf.functions are built with
             # jit_compile=False in sparse mode (see _make_tf_functions).
             logsnorm = tf.squeeze(
@@ -1313,91 +1312,42 @@ class Fitter:
                 axis=-1,
             )
 
-            nbins_out_int = (
-                self.indata.nbinsfull
-                if (full or not self.indata.nbinsmasked)
-                else self.indata.nbins
-            )
-            nbins_out = tf.constant(nbins_out_int, dtype=tf.int64)
-
-            if compute_norm:
-                # Slow path: caller actually wants the dense [nbins, nproc]
-                # tensor. Build snormnorm_sparse and densify, as before.
-                if self.indata.systematic_type == "log_normal":
-                    snorm = tf.exp(logsnorm)
-                    snormnorm_sparse = self.indata.norm.with_values(
-                        snorm * self.indata.norm.values
-                    )
-                elif self.indata.systematic_type == "normal":
-                    snormnorm_sparse = self.indata.norm * rnorm
-                    snormnorm_sparse = snormnorm_sparse.with_values(
-                        snormnorm_sparse.values + logsnorm
-                    )
-
-                if not full and self.indata.nbinsmasked:
-                    snormnorm_sparse = tfh.simple_sparse_slice0end(
-                        snormnorm_sparse, self.indata.nbins
-                    )
-
-                if self.indata.systematic_type == "log_normal":
-                    snormnorm = tf.sparse.to_dense(snormnorm_sparse)
-                    normcentral = rnorm * snormnorm
-                elif self.indata.systematic_type == "normal":
-                    normcentral = tf.sparse.to_dense(snormnorm_sparse)
-                nexpcentral = tf.reduce_sum(normcentral, axis=-1)
-            else:
-                # Fast path used by the NLL / gradient / HVP: compute
-                # per-nonzero-entry final values directly via gathers, then
-                # reduce to per-bin yields with one unsorted_segment_sum.
-                # No SparseTensor / SparseDenseCwiseMul / sparse_to_dense is
-                # used (those have no XLA kernels), and no dense
-                # [nbinsfull, nproc] intermediate is materialized in either
-                # the forward or the backward graph.
-                norm_indices = self.indata.norm.indices
-                norm_values = self.indata.norm.values
-                bin_idx_full = norm_indices[:, 0]
-                proc_idx_full = norm_indices[:, 1]
-
-                # rnorm has shape [1, nproc] or [nbinsfull, 1] depending on
-                # the POI model. Reshape to a flat dense tensor that we can
-                # gather from per-entry by either bin or proc index.
-                rnorm_shape = rnorm.shape
-                if rnorm_shape[0] == 1:
-                    # broadcast over bins; index by proc
-                    rnorm_per_entry = tf.gather(tf.reshape(rnorm, [-1]), proc_idx_full)
-                elif rnorm_shape[1] == 1:
-                    # broadcast over procs; index by bin
-                    rnorm_per_entry = tf.gather(tf.reshape(rnorm, [-1]), bin_idx_full)
-                else:
-                    # general [nbinsfull, nproc] rnorm: gather flat
-                    rnorm_flat = tf.reshape(rnorm, [-1])
-                    nproc = tf.cast(self.indata.nproc, bin_idx_full.dtype)
-                    rnorm_per_entry = tf.gather(
-                        rnorm_flat, bin_idx_full * nproc + proc_idx_full
-                    )
-
-                # logsnorm is per-row of the sparse tensor (one entry per
-                # nonzero of norm), so it can be used directly as a
-                # per-entry value.
-                if self.indata.systematic_type == "log_normal":
-                    final_values = norm_values * tf.exp(logsnorm) * rnorm_per_entry
-                else:  # "normal"
-                    final_values = norm_values * rnorm_per_entry + logsnorm
-
-                # Collapse per-entry contributions to per-bin yields. At
-                # this scale (~10^5 entries → ~10^5 bins) single-threaded
-                # unsorted_segment_sum beats the multi-threaded CSR matmul
-                # kernel — the CSR dispatch overhead dominates for small
-                # matrices. (Measured: switching this op to a CSR matvec
-                # was a 30% HVP regression on jpsi.)
-                nbinsfull_int = int(self.indata.nbinsfull)
-                nexp_full = tf.math.unsorted_segment_sum(
-                    final_values, bin_idx_full, num_segments=nbinsfull_int
+            # Build a sparse [nbinsfull, nproc] tensor whose values absorb
+            # the per-entry syst variation and the per-(bin, proc) POI
+            # scaling rnorm. The sparsity pattern is unchanged from
+            # self.indata.norm, so with_values lets us reuse the indices.
+            if self.indata.systematic_type == "log_normal":
+                # values[i] = norm[i] * exp(logsnorm[i]) * rnorm[bin, proc]
+                snormnorm_sparse = self.indata.norm.with_values(
+                    tf.exp(logsnorm) * self.indata.norm.values
                 )
-                if not full and self.indata.nbinsmasked:
-                    nexpcentral = nexp_full[: self.indata.nbins]
-                else:
-                    nexpcentral = nexp_full
+                snormnorm_sparse = snormnorm_sparse * rnorm
+            else:  # "normal"
+                # values[i] = norm[i] * rnorm[bin, proc] + logsnorm[i]
+                snormnorm_sparse = self.indata.norm * rnorm
+                snormnorm_sparse = snormnorm_sparse.with_values(
+                    snormnorm_sparse.values + logsnorm
+                )
+
+            if not full and self.indata.nbinsmasked:
+                snormnorm_sparse = tfh.simple_sparse_slice0end(
+                    snormnorm_sparse, self.indata.nbins
+                )
+
+            # Per-bin yields via unsorted_segment_sum on the sparse values
+            # keyed by bin index. Equivalent to tf.sparse.reduce_sum(...,
+            # axis=-1) but uses the dedicated segment_sum kernel directly,
+            # which has lower per-call overhead. The dense [nbinsfull,
+            # nproc] grid is only materialized when an external caller
+            # requested per-process yields (compute_norm=True).
+            nbinsfull_int = int(snormnorm_sparse.dense_shape[0])
+            nexpcentral = tf.math.unsorted_segment_sum(
+                snormnorm_sparse.values,
+                snormnorm_sparse.indices[:, 0],
+                num_segments=nbinsfull_int,
+            )
+            if compute_norm:
+                normcentral = tf.sparse.to_dense(snormnorm_sparse)
         else:
             if full or self.indata.nbinsmasked == 0:
                 nbins = self.indata.nbinsfull
