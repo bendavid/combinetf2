@@ -2226,7 +2226,7 @@ class Fitter:
                 total = total + 0.5 * tf.reduce_sum(x_sub * Hx)
         return total
 
-    def _compute_nll(self, profile=True, full_nll=False, skip_external=False):
+    def _compute_nll(self, profile=True, full_nll=False):
         ln, lc, lbeta, lpenalty, beta = self._compute_nll_components(
             profile=profile, full_nll=full_nll
         )
@@ -2238,214 +2238,68 @@ class Fitter:
         if lpenalty is not None:
             l = l + lpenalty
 
-        if not skip_external:
-            lext = self._compute_external_nll()
-            if lext is not None:
-                l = l + lext
+        lext = self._compute_external_nll()
+        if lext is not None:
+            l = l + lext
         return l
 
-    def _compute_loss(self, profile=True, skip_external=False):
-        l = self._compute_nll(profile=profile, skip_external=skip_external)
-        return l
-
-    def _external_contributions(self, p=None):
-        """Closed-form contributions of the external likelihood terms to the
-        value, gradient, and (optionally) Hessian-vector product of the NLL.
-
-        For each external term -log L_ext = g^T x_sub + 0.5 x_sub^T H x_sub
-        (with x_sub = self.x[term["indices"]]), the gradient and HVP are
-        analytic linear-algebra expressions that don't require autodiff. The
-        per-term cost is dominated by one or two segment_sums (sparse H) or
-        matvecs (dense H), evaluated exactly once per outer call.
-
-        This is much cheaper than letting reverse-over-reverse autodiff
-        rederive these expressions inside a nested tape, where the gather
-        backward becomes a scatter into the parameter vector that gets
-        rematerialized multiple times in the second-order graph.
-
-        Returns
-        -------
-        (val, grad, hvp) : tuple of Tensor or None
-            val: scalar contribution to the loss; None if there are no terms.
-            grad: contribution to the full gradient (shape self.x.shape).
-            hvp: contribution to H @ p (shape self.x.shape), or None when p
-            is None.
-        """
-        if not self.external_terms:
-            return None, None, None
-
-        npar = int(self.x.shape[0])
-        dtype = self.indata.dtype
-        val = tf.zeros([], dtype=dtype)
-        grad = tf.zeros([npar], dtype=dtype)
-        hvp = tf.zeros([npar], dtype=dtype) if p is not None else None
-
-        for term in self.external_terms:
-            idx = term["indices"]
-            idx2d = tf.reshape(idx, [-1, 1])
-            x_sub = tf.gather(self.x, idx)
-            g_sub = tf.zeros_like(x_sub)
-
-            if term["grad"] is not None:
-                # linear part: val += g^T x_sub, grad += g, HVP += 0
-                val = val + tf.reduce_sum(term["grad"] * x_sub)
-                g_sub = g_sub + term["grad"]
-
-            if term["hess_dense"] is not None:
-                # dense quadratic: val += 0.5 x^T H x, grad += H x, HVP += H p
-                Hx = tf.linalg.matvec(term["hess_dense"], x_sub)
-                val = val + 0.5 * tf.reduce_sum(x_sub * Hx)
-                g_sub = g_sub + Hx
-                if p is not None:
-                    p_sub = tf.gather(p, idx)
-                    Hp = tf.linalg.matvec(term["hess_dense"], p_sub)
-                    hvp = tf.tensor_scatter_nd_add(hvp, idx2d, Hp)
-            elif term["hess_csr"] is not None:
-                # Sparse symmetric quadratic. H is full symmetric, so the
-                # loss is L = 0.5 x^T H x with gradient H @ x and HVP H @ p,
-                # each a single CSR matvec via tf.linalg.sparse's multi-
-                # threaded SparseMatrixMatMul kernel.
-                H_csr = term["hess_csr"]
-                Hx = tf.squeeze(tf_sparse_csr.matmul(H_csr, x_sub[:, None]), axis=-1)
-                val = val + 0.5 * tf.reduce_sum(x_sub * Hx)
-                g_sub = g_sub + Hx
-
-                if p is not None:
-                    p_sub = tf.gather(p, idx)
-                    Hp = tf.squeeze(
-                        tf_sparse_csr.matmul(H_csr, p_sub[:, None]), axis=-1
-                    )
-                    hvp = tf.tensor_scatter_nd_add(hvp, idx2d, Hp)
-
-            grad = tf.tensor_scatter_nd_add(grad, idx2d, g_sub)
-
-        return val, grad, hvp
+    def _compute_loss(self, profile=True):
+        return self._compute_nll(profile=profile)
 
     def _make_tf_functions(self):
         # Build tf.function wrappers at instance construction time so that
         # jit_compile can be toggled via options without redefining the class.
         #
-        # Each public wrapper is split into two halves:
-        #   * a jit-compilable "core" that runs the autodiff'd NLL with
-        #     skip_external=True (no external-likelihood ops in its graph),
-        #   * a separate, NOT-jit-compiled "external" tf.function that
-        #     contributes the closed-form value/gradient/HVP for any
-        #     external likelihood terms.
-        # The split is needed when the autodiff core is jit-compiled and
-        # external terms exist: the closed-form external path uses
-        # tf.linalg.sparse's CSR matmul, which has no XLA kernel, so it
-        # cannot live inside a jit cluster. In sparse mode the core itself
-        # already uses the CSR matmul for the logk contraction, so its
-        # tf.function is built with jit_compile=False regardless, and the
-        # external contributions can then be merged back into the core.
-        #
-        # Skipping the external contributions in the autodiff path also
-        # avoids rematerializing the expensive external-Hessian
-        # gather/scatter chain inside the nested second-order tape, which
-        # was the dominant cost on large external-Hessian problems like the
-        # jpsi calibration before this rewrite.
-        has_external = bool(self.external_terms)
         # SparseMatrixMatMul has no XLA kernel, so any tf.function that
         # uses it (either via _compute_yields_noBBB in sparse mode, or via
-        # _external_contributions) cannot be jit-compiled.
-        jit_for_core = self.jit_compile and not self.indata.sparse
-        # The external contribution is split out into a separate un-jitted
-        # tf.function only when the core is itself jit-compiled. Otherwise
-        # the core can include the external term directly.
-        use_ext_split = has_external and jit_for_core
-        skip_ext = use_ext_split
-        jit = jit_for_core
+        # the external sparse-Hessian path in _compute_external_nll) cannot
+        # be jit-compiled. In sparse mode we therefore force jit_compile
+        # off on all wrappers.
+        jit = self.jit_compile and not self.indata.sparse
 
-        def _core_val(self):
-            return self._compute_loss(skip_external=skip_ext)
+        def _loss_val(self):
+            return self._compute_loss()
 
-        def _core_val_grad(self):
+        def _loss_val_grad(self):
             with tf.GradientTape() as t:
-                val = self._compute_loss(skip_external=skip_ext)
+                val = self._compute_loss()
             grad = t.gradient(val, self.x)
             return val, grad
 
-        def _core_val_grad_hessp_fwdrev(self, p):
+        def _loss_val_grad_hessp_fwdrev(self, p):
             p = tf.stop_gradient(p)
             with tf.autodiff.ForwardAccumulator(self.x, p) as acc:
                 with tf.GradientTape() as grad_tape:
-                    val = self._compute_loss(skip_external=skip_ext)
+                    val = self._compute_loss()
                 grad = grad_tape.gradient(val, self.x)
             hessp = acc.jvp(grad)
             return val, grad, hessp
 
-        def _core_val_grad_hessp_revrev(self, p):
+        def _loss_val_grad_hessp_revrev(self, p):
             p = tf.stop_gradient(p)
             with tf.GradientTape() as t2:
                 with tf.GradientTape() as t1:
-                    val = self._compute_loss(skip_external=skip_ext)
+                    val = self._compute_loss()
                 grad = t1.gradient(val, self.x)
             hessp = t2.gradient(grad, self.x, output_gradients=p)
             return val, grad, hessp
 
-        # Closed-form external contributions (no jit, since
-        # sparse_dense_matmul has no XLA kernel). Returns (val, grad, hvp);
-        # hvp is None when p is None.
-        def _ext_val_grad(self):
-            return self._external_contributions(None)
-
-        def _ext_val_grad_hvp(self, p):
-            return self._external_contributions(p)
-
-        core_val = tf.function(jit_compile=jit)(_core_val.__get__(self, type(self)))
-        core_val_grad = tf.function(jit_compile=jit)(
-            _core_val_grad.__get__(self, type(self))
+        self.loss_val = tf.function(jit_compile=jit)(
+            _loss_val.__get__(self, type(self))
+        )
+        self.loss_val_grad = tf.function(jit_compile=jit)(
+            _loss_val_grad.__get__(self, type(self))
         )
         # NOTE: fwdrev HVP is NOT jit-compiled. tf.autodiff.ForwardAccumulator
         # does not propagate JVPs through XLA-compiled subgraphs (the JVP
         # comes back as zero), regardless of inner/outer placement. The
-        # loss/grad and revrev HVP cores are unaffected.
-        core_hvp_fwdrev = tf.function(
-            _core_val_grad_hessp_fwdrev.__get__(self, type(self))
+        # loss/grad and revrev HVP wrappers are unaffected.
+        self.loss_val_grad_hessp_fwdrev = tf.function(
+            _loss_val_grad_hessp_fwdrev.__get__(self, type(self))
         )
-        core_hvp_revrev = tf.function(jit_compile=jit)(
-            _core_val_grad_hessp_revrev.__get__(self, type(self))
+        self.loss_val_grad_hessp_revrev = tf.function(jit_compile=jit)(
+            _loss_val_grad_hessp_revrev.__get__(self, type(self))
         )
-        ext_val_grad = tf.function(_ext_val_grad.__get__(self, type(self)))
-        ext_val_grad_hvp = tf.function(_ext_val_grad_hvp.__get__(self, type(self)))
-
-        # Public wrappers: thin Python that runs the (possibly jit-compiled)
-        # core and adds the external contributions, both as already-built
-        # tf.functions so each side gets cached / traced once. When the
-        # external contribution is folded into the core (use_ext_split is
-        # False), the public wrappers are the cores directly.
-        if use_ext_split:
-
-            def loss_val():
-                v = core_val()
-                v_ext, _, _ = ext_val_grad()
-                return v + v_ext
-
-            def loss_val_grad():
-                v, g = core_val_grad()
-                v_ext, g_ext, _ = ext_val_grad()
-                return v + v_ext, g + g_ext
-
-            def loss_val_grad_hessp_fwdrev(p):
-                v, g, h = core_hvp_fwdrev(p)
-                v_ext, g_ext, h_ext = ext_val_grad_hvp(p)
-                return v + v_ext, g + g_ext, h + h_ext
-
-            def loss_val_grad_hessp_revrev(p):
-                v, g, h = core_hvp_revrev(p)
-                v_ext, g_ext, h_ext = ext_val_grad_hvp(p)
-                return v + v_ext, g + g_ext, h + h_ext
-
-        else:
-            loss_val = core_val
-            loss_val_grad = core_val_grad
-            loss_val_grad_hessp_fwdrev = core_hvp_fwdrev
-            loss_val_grad_hessp_revrev = core_hvp_revrev
-
-        self.loss_val = loss_val
-        self.loss_val_grad = loss_val_grad
-        self.loss_val_grad_hessp_fwdrev = loss_val_grad_hessp_fwdrev
-        self.loss_val_grad_hessp_revrev = loss_val_grad_hessp_revrev
         # tf.autodiff.ForwardAccumulator does not support tangent
         # propagation through SparseMatrixMatMul (no JVP rule for the
         # CSR variant), so the fwdrev HVP cannot be used in sparse mode.
