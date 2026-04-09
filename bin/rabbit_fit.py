@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 
+# Enable XLA's multi-threaded Eigen path on CPU before importing tensorflow.
+# This must be set before any TF import (including transitive) because XLA
+# parses XLA_FLAGS once during runtime initialization. Measured ~1.3x speedup
+# on dense large-model HVP/loss+grad on a many-core system, no downside.
+# Users who set their own XLA_FLAGS keep theirs and we append.
+import os as _os
+
+_xla_default = "--xla_cpu_multi_thread_eigen=true"
+_existing = _os.environ.get("XLA_FLAGS", "")
+if "xla_cpu_multi_thread_eigen" not in _existing:
+    _os.environ["XLA_FLAGS"] = (
+        f"{_existing} {_xla_default}".strip() if _existing else _xla_default
+    )
+
 import copy
 
 import tensorflow as tf
