@@ -121,6 +121,8 @@ class Fitter:
 
         self.diagnostics = options.diagnostics
         self.minimizer_method = options.minimizerMethod
+        self.hvp_method = getattr(options, "hvpMethod", "revrev")
+        self.jit_compile = getattr(options, "jitCompile", True)
 
         if options.covarianceFit and options.chisqFit:
             raise Exception(
@@ -404,6 +406,11 @@ class Fitter:
                     tf.function(val.python_function.__get__(self, type(self))),
                 )
 
+        # (re)build instance-level tf.function wrappers for loss/grad/HVP, which
+        # are constructed dynamically so that jit_compile and the HVP autodiff
+        # mode can be controlled via fit options.
+        self._make_tf_functions()
+
     def __deepcopy__(self, memo):
         import copy
 
@@ -415,12 +422,23 @@ class Fitter:
             for name in self.__dict__
             if hasattr(getattr(type(self), name, None), "python_function")
         }
-        state = {k: v for k, v in self.__dict__.items() if k not in jit_overrides}
+        # Also strip the dynamically-built loss/grad/HVP tf.function wrappers,
+        # which hold un-copyable FuncGraph state and will be rebuilt below.
+        dynamic_tf_funcs = {
+            "loss_val",
+            "loss_val_grad",
+            "loss_val_grad_hessp",
+            "loss_val_grad_hessp_fwdrev",
+            "loss_val_grad_hessp_revrev",
+        }
+        skip = jit_overrides | dynamic_tf_funcs
+        state = {k: v for k, v in self.__dict__.items() if k not in skip}
         cls = type(self)
         obj = cls.__new__(cls)
         memo[id(self)] = obj
         for k, v in state.items():
             setattr(obj, k, copy.deepcopy(v, memo))
+        obj._make_tf_functions()
         return obj
 
     def load_fitresult(self, fitresult_file, fitresult_key, profile=True):
@@ -2172,44 +2190,61 @@ class Fitter:
         return l
 
     def _compute_loss(self, profile=True):
-        l = self._compute_nll(profile=profile)
-        return l
+        return self._compute_nll(profile=profile)
 
-    @tf.function
-    def loss_val(self):
-        val = self._compute_loss()
-        return val
+    def _make_tf_functions(self):
+        # Build tf.function wrappers at instance construction time so that
+        # jit_compile and the HVP autodiff mode can be controlled via fit
+        # options without redefining the class.
+        jit = self.jit_compile
 
-    @tf.function
-    def loss_val_grad(self):
-        with tf.GradientTape() as t:
-            val = self._compute_loss()
-        grad = t.gradient(val, self.x)
-        return val, grad
+        def _loss_val(self):
+            return self._compute_loss()
 
-    # FIXME in principle this version of the function is preferred
-    # but seems to introduce some small numerical non-reproducibility
-    @tf.function
-    def loss_val_grad_hessp_fwdrev(self, p):
-        p = tf.stop_gradient(p)
-        with tf.autodiff.ForwardAccumulator(self.x, p) as acc:
-            with tf.GradientTape() as grad_tape:
+        def _loss_val_grad(self):
+            with tf.GradientTape() as t:
                 val = self._compute_loss()
-            grad = grad_tape.gradient(val, self.x)
-        hessp = acc.jvp(grad)
-        return val, grad, hessp
+            grad = t.gradient(val, self.x)
+            return val, grad
 
-    @tf.function
-    def loss_val_grad_hessp_revrev(self, p):
-        p = tf.stop_gradient(p)
-        with tf.GradientTape() as t2:
-            with tf.GradientTape() as t1:
-                val = self._compute_loss()
-            grad = t1.gradient(val, self.x)
-        hessp = t2.gradient(grad, self.x, output_gradients=p)
-        return val, grad, hessp
+        def _loss_val_grad_hessp_fwdrev(self, p):
+            p = tf.stop_gradient(p)
+            with tf.autodiff.ForwardAccumulator(self.x, p) as acc:
+                with tf.GradientTape() as grad_tape:
+                    val = self._compute_loss()
+                grad = grad_tape.gradient(val, self.x)
+            hessp = acc.jvp(grad)
+            return val, grad, hessp
 
-    loss_val_grad_hessp = loss_val_grad_hessp_revrev
+        def _loss_val_grad_hessp_revrev(self, p):
+            p = tf.stop_gradient(p)
+            with tf.GradientTape() as t2:
+                with tf.GradientTape() as t1:
+                    val = self._compute_loss()
+                grad = t1.gradient(val, self.x)
+            hessp = t2.gradient(grad, self.x, output_gradients=p)
+            return val, grad, hessp
+
+        self.loss_val = tf.function(jit_compile=jit)(
+            _loss_val.__get__(self, type(self))
+        )
+        self.loss_val_grad = tf.function(jit_compile=jit)(
+            _loss_val_grad.__get__(self, type(self))
+        )
+        # NOTE: fwdrev HVP is NOT jit-compiled. tf.autodiff.ForwardAccumulator
+        # does not propagate JVPs through XLA-compiled subgraphs (the JVP
+        # comes back as zero), regardless of inner/outer placement. The
+        # loss/grad and revrev HVP wrappers are unaffected.
+        self.loss_val_grad_hessp_fwdrev = tf.function(
+            _loss_val_grad_hessp_fwdrev.__get__(self, type(self))
+        )
+        self.loss_val_grad_hessp_revrev = tf.function(jit_compile=jit)(
+            _loss_val_grad_hessp_revrev.__get__(self, type(self))
+        )
+        if self.hvp_method == "fwdrev":
+            self.loss_val_grad_hessp = self.loss_val_grad_hessp_fwdrev
+        else:
+            self.loss_val_grad_hessp = self.loss_val_grad_hessp_revrev
 
     @tf.function
     def loss_val_grad_hess(self, profile=True):
