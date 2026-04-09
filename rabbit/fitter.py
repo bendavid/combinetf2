@@ -346,16 +346,30 @@ class Fitter:
             )
 
             tf_hess_dense = None
-            tf_hess_sparse = None
+            tf_hess_csr = None
             if term["hess_dense"] is not None:
                 tf_hess_dense = tf.constant(term["hess_dense"], dtype=self.indata.dtype)
             elif term["hess_sparse"] is not None:
+                # Build a CSRSparseMatrix view of the stored sparse Hessian
+                # for use in the closed-form external gradient/HVP path via
+                # sm.matmul. The Hessian is assumed symmetric, so the loss
+                # L = 0.5 x_sub^T H x_sub has gradient H @ x_sub and HVP
+                # H @ p_sub, each a single sm.matmul call. NOTE:
+                # SparseMatrixMatMul has no XLA kernel, so any tf.function
+                # that calls sm.matmul must be built with jit_compile=False.
                 rows, cols, vals = term["hess_sparse"]
-                tf_hess_sparse = (
-                    tf.constant(rows, dtype=tf.int64),
-                    tf.constant(cols, dtype=tf.int64),
-                    tf.constant(vals, dtype=self.indata.dtype),
+                rows_np = np.asarray(rows, dtype=np.int64)
+                cols_np = np.asarray(cols, dtype=np.int64)
+                vals_np = np.asarray(vals)
+                n_sub = int(len(params))
+                order = np.lexsort((cols_np, rows_np))
+                indices_sorted = np.stack([rows_np[order], cols_np[order]], axis=1)
+                hess_st = tf.SparseTensor(
+                    indices=tf.constant(indices_sorted, dtype=tf.int64),
+                    values=tf.constant(vals_np[order], dtype=self.indata.dtype),
+                    dense_shape=tf.constant([n_sub, n_sub], dtype=tf.int64),
                 )
+                tf_hess_csr = tf_sparse_csr.CSRSparseMatrix(hess_st)
 
             self.external_terms.append(
                 {
@@ -363,7 +377,7 @@ class Fitter:
                     "indices": tf_indices,
                     "grad": tf_grad,
                     "hess_dense": tf_hess_dense,
-                    "hess_sparse": tf_hess_sparse,
+                    "hess_csr": tf_hess_csr,
                 }
             )
 
@@ -2185,7 +2199,17 @@ class Fitter:
         return ln, lc, lbeta, lpenalty, beta
 
     def _compute_external_nll(self):
-        """Sum of external likelihood term contributions: sum_i (g_i^T x_sub + 0.5 x_sub^T H_i x_sub)."""
+        """Sum of external likelihood term contributions: sum_i (g_i^T x_sub + 0.5 x_sub^T H_i x_sub).
+
+        For sparse-Hessian terms this uses tf.linalg.sparse's CSR matmul,
+        which dispatches to a multi-threaded kernel and is much faster
+        per call than the previous element-wise gather-based form. The
+        autodiff gradient and HVP of 0.5 x^T H x via sm.matmul are
+        themselves single sm.matmul calls, so reverse-over-reverse autodiff
+        no longer rematerializes a 2D gather/scatter chain in the second-
+        order tape — that was the dominant cost on large external-Hessian
+        problems before this rewrite (e.g. jpsi: 329M-nnz prefit Hessian).
+        """
         if not self.external_terms:
             return None
         total = tf.zeros([], dtype=self.indata.dtype)
@@ -2198,11 +2222,13 @@ class Fitter:
                 total = total + 0.5 * tf.reduce_sum(
                     x_sub * tf.linalg.matvec(term["hess_dense"], x_sub)
                 )
-            elif term["hess_sparse"] is not None:
-                rows, cols, vals = term["hess_sparse"]
-                total = total + 0.5 * tf.reduce_sum(
-                    vals * tf.gather(x_sub, rows) * tf.gather(x_sub, cols)
+            elif term["hess_csr"] is not None:
+                # Loss = 0.5 * x_sub^T H x_sub via CSR matvec (H symmetric).
+                Hx = tf.squeeze(
+                    tf_sparse_csr.matmul(term["hess_csr"], x_sub[:, None]),
+                    axis=-1,
                 )
+                total = total + 0.5 * tf.reduce_sum(x_sub * Hx)
         return total
 
     def _compute_nll(self, profile=True, full_nll=False):
