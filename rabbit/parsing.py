@@ -241,6 +241,14 @@ def common_parser():
         help="Don't compute the hessian of parameters",
     )
     parser.add_argument(
+        "--covFullRow",
+        default=False,
+        action="store_true",
+        help="Under --noHessian, use the full-row relative-error stopping "
+        "criterion for the covariance CG solves instead of the (much "
+        "cheaper) single-diagonal Gauss-quadrature criterion",
+    )
+    parser.add_argument(
         "--prefitUnconstrainedNuisanceUncertainty",
         default=0.0,
         type=float,

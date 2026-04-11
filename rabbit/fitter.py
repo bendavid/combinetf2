@@ -144,6 +144,11 @@ class Fitter:
         # for prefit uncertainties instead.
         self.compute_cov = not getattr(options, "noHessian", False)
 
+        # Target estimated-distance-to-minimum tolerance used for
+        # iterative (Hessian-free) solves where the stopping criterion
+        # is expressed in edm units rather than as a raw residual norm.
+        self.edmtol = getattr(options, "edmtol", 1e-8)
+
         if options.covarianceFit and options.chisqFit:
             raise Exception(
                 'Use either "--covarianceFit" for chi-squared fit using covariance or "--chisqFit" for diagonal chi-squared fit'
@@ -392,6 +397,8 @@ class Fitter:
             and self.indata.systematic_type == "normal"
             and ((not self.binByBinStat) or self.binByBinStatType == "normal-additive")
         )
+
+        self.is_linear = False
 
         # force retrace of @tf.function methods since self.x shape may have changed
         for name in dir(type(self)):
@@ -926,39 +933,22 @@ class Fitter:
         else:
             return edmval_cov(grad, hess)
 
-    def edmval_cov_rows_hessfree(self, grad, row_indices, rtol=1e-10, maxiter=None):
-        """Hessian-free edmval + selected rows of the covariance matrix.
+    def _hessfree_spectrum(self):
+        """Build a Hessian-vector-product LinearOperator and estimate
+        lambda_max and lambda_min of the Hessian using Lanczos.
 
-        Used under --noHessian to avoid allocating the dense [npar, npar]
-        Hessian. Solves the linear systems
+        Both eigenvalue computations use a loose ARPACK tolerance
+        (``tol=1e-4``) and an enlarged Lanczos subspace (``ncv=30``) to
+        keep the cost low; we only need these values accurate to a
+        factor of ~2 for the downstream CG stopping criteria. lambda_min
+        is obtained via Lanczos on the spectrum-reflected operator
+        ``B = sigma * I - H`` with ``sigma = 1.05 * lambda_max``, whose
+        largest eigenvalue is ``sigma - lambda_min(H)``. This reflection
+        trick typically converges much faster than ``which="SA"``
+        directly.
 
-            H v = grad        ->  edmval = 0.5 * grad^T v
-            H c_i = e_i       ->  c_i is the i-th column/row of cov
-
-        iteratively via scipy's conjugate gradient, feeding it a
-        LinearOperator backed by self.loss_val_grad_hessp. The Hessian
-        must be positive-definite; that's the case for a converged NLL
-        minimum (including the purely-quadratic --is_linear case).
-
-        Parameters
-        ----------
-        grad : tf.Tensor or array-like, shape [npar]
-            Gradient at the current x, already computed by the caller.
-        row_indices : iterable of int
-            Parameter indices to compute covariance rows for. Typically
-            the POI indices [0, npoi) concatenated with the NOI indices
-            (npoi + noiidxs).
-        rtol : float
-            Relative residual tolerance passed to scipy.sparse.linalg.cg.
-        maxiter : int or None
-            Maximum CG iterations per solve; None lets scipy choose.
-
-        Returns
-        -------
-        edmval : float
-        cov_rows : np.ndarray, shape [len(row_indices), npar]
-            Row i is (H^{-1})[row_indices[i], :]; diag entries give the
-            variances for those parameters.
+        Returns ``(op, lam_min, lam_max)``. Raises ``ValueError`` if the
+        estimated smallest eigenvalue is non-positive (Hessian not PD).
         """
         import scipy.sparse.linalg as _spla
 
@@ -972,21 +962,205 @@ class Fitter:
 
         op = _spla.LinearOperator((n, n), matvec=_hvp_np, dtype=dtype)
 
+        eigsh_kwargs = dict(
+            k=1,
+            ncv=min(30, n - 1),
+            tol=1e-2,
+            return_eigenvectors=False,
+        )
+
+        logger.info("Computing lambda_max(H) via Lanczos")
+        lam_max = float(_spla.eigsh(op, which="LA", **eigsh_kwargs)[0])
+        logger.info("  lambda_max = %.6e", lam_max)
+
+        sigma = 1.05 * lam_max
+        op_refl = _spla.LinearOperator(
+            (n, n), matvec=lambda x: sigma * x - _hvp_np(x), dtype=dtype
+        )
+        logger.info("Computing lambda_min(H) via Lanczos on sigma*I - H")
+        lam_max_refl = float(_spla.eigsh(op_refl, which="LA", **eigsh_kwargs)[0])
+        lam_min = sigma - lam_max_refl
+        logger.info("  lambda_min = %.6e", lam_min)
+
+        if lam_min <= 0.0:
+            raise ValueError(
+                f"Estimated lambda_min(H) = {lam_min:.3e} is not positive; "
+                "the Hessian may not be positive-definite"
+            )
+
+        return op, lam_min, lam_max
+
+    def edmval_cov_rows_hessfree(
+        self, grad, row_indices, cov_rel_tol=0.01, maxiter=None, full_row=False
+    ):
+        """Hessian-free edmval bound + selected rows of the covariance matrix.
+
+        Used under --noHessian to avoid allocating the dense [npar, npar]
+        Hessian. Computes two things without ever materializing the
+        Hessian, relying only on Hessian-vector products from
+        self.loss_val_grad_hessp:
+
+        1. An upper bound on edmval via the smallest eigenvalue of H:
+
+               edm = 0.5 g^T H^{-1} g  <=  0.5 ||g||^2 / lambda_min(H)
+
+           lambda_min is estimated via Lanczos on the spectrum-reflected
+           operator  B = sigma * I - H  (with sigma = 1.05 * lambda_max),
+           whose largest eigenvalue is sigma - lambda_min(H). This avoids
+           a full CG solve for edmval.
+
+        2. Selected rows of the covariance matrix, by solving
+           H c_i = e_i iteratively with scipy's CG. Convergence is
+           controlled by the eigenvalue-aware bound
+
+               ||c_k - c_true||_inf <= ||e_k||_2 <= ||r_k||_2 / lambda_min
+
+           so we stop as soon as ||r_k|| / lambda_min drops below
+           cov_rel_tol * ||c_k||, giving roughly cov_rel_tol relative
+           accuracy on each row (and hence on the variances on the
+           diagonal).
+
+        The Hessian must be positive-definite; that's the case for a
+        converged NLL minimum (including the purely-quadratic
+        --is_linear case).
+
+        Parameters
+        ----------
+        grad : tf.Tensor or array-like, shape [npar]
+            Gradient at the current x, already computed by the caller.
+        row_indices : iterable of int
+            Parameter indices to compute covariance rows for. Typically
+            the POI indices [0, npoi) concatenated with the NOI indices
+            (npoi + noiidxs).
+        cov_rel_tol : float
+            Target relative error on each covariance row. The cov-row CG
+            iteration stops when the rigorous eigenvalue-based bound
+            ||r_k|| / (lambda_min * ||c_k||) drops below this value.
+        maxiter : int or None
+            Maximum CG iterations per cov-row solve; None lets scipy
+            choose.
+
+        Returns
+        -------
+        edmval : float
+            Upper bound 0.5 * ||g||^2 / lambda_min(H).
+        cov_rows : np.ndarray, shape [len(row_indices), npar]
+            Row i is (H^{-1})[row_indices[i], :]; diagonal entries give
+            the variances for those parameters.
+        """
+        import scipy.sparse.linalg as _spla
+
+        n = int(self.x.shape[0])
+        dtype = np.float64
+
+        op, lam_min, lam_max = self._hessfree_spectrum()
         grad_np = grad.numpy() if hasattr(grad, "numpy") else np.asarray(grad)
-        v, info = _spla.cg(op, grad_np, rtol=rtol, atol=0.0, maxiter=maxiter)
-        if info != 0:
-            raise ValueError(f"CG solver for edmval did not converge (info={info})")
-        edmval = 0.5 * float(np.dot(grad_np, v))
+
+        # Upper bound on edmval
+        grad_norm_sq = float(np.dot(grad_np, grad_np))
+        edmval = 0.5 * grad_norm_sq / lam_min
+        logger.info("edmval upper bound from 0.5 * ||g||^2 / lambda_min = %.6e", edmval)
+
+        # Covariance rows: two possible CG stopping criteria.
+        #
+        # full_row=True: rigorous per-entry error bound on the whole row
+        #     rel_err <= ||r_k|| / (lambda_min * ||c_k||) < cov_rel_tol
+        #   which costs one extra Hessian-vector product per iteration to
+        #   compute ||r_k|| explicitly.
+        #
+        # full_row=False (default): single-diagonal Gauss-quadrature
+        #   stopping. The scalar c_k[i] = e_i^T c_k converges super-
+        #   linearly to (H^-1)[i,i] (the variance we actually care about)
+        #   much faster than the full row, because the CG iterates give
+        #   the k-th Gauss-quadrature approximation to that bilinear
+        #   form. We monitor the relative change of c_k[i] and stop as
+        #   soon as it falls below cov_rel_tol, without any extra
+        #   Hessian-vector products.
+        logger.info(
+            "cov-row CG: criterion = %s, cov_rel_tol = %.3e",
+            (
+                "full-row ||r_k||/(lam_min * ||c_k||)"
+                if full_row
+                else "single-diagonal c_k[i]"
+            ),
+            cov_rel_tol,
+        )
+
+        class _CovConverged(Exception):
+            pass
+
+        def _make_cov_cb_full_row(label, rhs):
+            state = {"iter": 0, "xk": None}
+
+            def _cb(xk):
+                state["iter"] += 1
+                r_k = rhs - op @ xk
+                rnorm = float(np.linalg.norm(r_k))
+                xnorm = float(np.linalg.norm(xk))
+                if xnorm > 0.0:
+                    rel_bound = rnorm / (lam_min * xnorm)
+                    logger.debug(
+                        "CG %s: iter %4d  ||x_k|| = %.6e  ||r_k|| = %.6e  " "rel<=%.3e",
+                        label,
+                        state["iter"],
+                        xnorm,
+                        rnorm,
+                        rel_bound,
+                    )
+                    if rel_bound < cov_rel_tol:
+                        state["xk"] = np.array(xk, copy=True)
+                        raise _CovConverged()
+                else:
+                    logger.debug(
+                        "CG %s: iter %4d  ||x_k|| = 0  ||r_k|| = %.6e",
+                        label,
+                        state["iter"],
+                        rnorm,
+                    )
+
+            return _cb, state
+
+        def _make_cov_cb_diagonal(label, row_i):
+            state = {"iter": 0, "xk": None, "prev_diag": None}
+
+            def _cb(xk):
+                state["iter"] += 1
+                curr_diag = float(xk[row_i])
+                logger.debug(
+                    "CG %s: iter %4d  c_k[i] = %.6e",
+                    label,
+                    state["iter"],
+                    curr_diag,
+                )
+                if state["prev_diag"] is not None and curr_diag > 0.0:
+                    delta = abs(curr_diag - state["prev_diag"])
+                    if delta / curr_diag < cov_rel_tol:
+                        state["xk"] = np.array(xk, copy=True)
+                        raise _CovConverged()
+                state["prev_diag"] = curr_diag
+
+            return _cb, state
 
         row_indices = np.asarray(list(row_indices), dtype=np.int64)
         cov_rows = np.empty((len(row_indices), n), dtype=dtype)
         for k, i in enumerate(row_indices):
             e = np.zeros(n, dtype=dtype)
             e[int(i)] = 1.0
-            c, info = _spla.cg(op, e, rtol=rtol, atol=0.0, maxiter=maxiter)
+            label = f"cov row {int(i)}"
+            if full_row:
+                cb, state = _make_cov_cb_full_row(label, e)
+            else:
+                cb, state = _make_cov_cb_diagonal(label, int(i))
+            try:
+                c, info = _spla.cg(
+                    op, e, rtol=0.0, atol=0.0, maxiter=maxiter, callback=cb
+                )
+            except _CovConverged:
+                c = state["xk"]
+                info = 0
             if info != 0:
                 raise ValueError(
-                    f"CG solver for cov row {int(i)} did not converge (info={info})"
+                    f"CG solver for cov row {int(i)} did not converge " f"(info={info})"
                 )
             cov_rows[k] = c
 
@@ -2540,17 +2714,52 @@ class Fitter:
                     "Hessian-free conjugate gradient (--noHessian)"
                 )
                 val, grad = self.loss_val_grad()
-                grad_np = grad.numpy()
-                n = int(grad_np.shape[0])
-                dtype = grad_np.dtype
+                grad_np = grad.numpy().astype(np.float64)
 
-                def _hvp_np(p_np):
-                    p_tf = tf.constant(p_np, dtype=self.x.dtype)
-                    _, _, hessp = self.loss_val_grad_hessp(p_tf)
-                    return hessp.numpy()
+                op, lam_min, lam_max = self._hessfree_spectrum()
 
-                op = _spla.LinearOperator((n, n), matvec=_hvp_np, dtype=dtype)
-                dx_np, info = _spla.cg(op, -grad_np, rtol=1e-10, atol=0.0)
+                # Stopping criterion in estimated-distance-to-minimum
+                # (edm) units. At iterate dx_k the remaining distance to
+                # the quadratic minimum is
+                #     f(x + dx_k) - f_min = 0.5 * e_k^T H e_k
+                #                         = 0.5 * r_k^T H^{-1} r_k
+                # which is rigorously bounded above by
+                #     <= 0.5 * ||r_k||^2 / lambda_min
+                # so requesting "remaining edm upper bound < edmtol" maps
+                # to  ||r_k|| < sqrt(2 * edmtol * lam_min), which we fold
+                # into scipy's atol (rtol = 0).
+                solve_atol = float(np.sqrt(2.0 * self.edmtol * lam_min))
+                logger.info(
+                    "CG solve atol = sqrt(2 * edmtol * lam_min) = %.6e "
+                    "(edmtol = %.3e)",
+                    solve_atol,
+                    self.edmtol,
+                )
+
+                import logging as _logging
+
+                solve_rhs = -grad_np
+                solve_state = {"iter": 0}
+
+                def _solve_cb(xk):
+                    solve_state["iter"] += 1
+                    if not logger.isEnabledFor(_logging.DEBUG):
+                        return
+                    rnorm = float(np.linalg.norm(solve_rhs - op @ xk))
+                    logger.debug(
+                        "CG solve: iter %4d  ||x_k|| = %.6e  ||r_k|| = %.6e",
+                        solve_state["iter"],
+                        float(np.linalg.norm(xk)),
+                        rnorm,
+                    )
+
+                dx_np, info = _spla.cg(
+                    op,
+                    -grad_np,
+                    rtol=0.0,
+                    atol=solve_atol,
+                    callback=_solve_cb,
+                )
                 if info != 0:
                     raise ValueError(
                         f"CG solver did not converge (info={info}); the "

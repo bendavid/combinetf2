@@ -482,7 +482,9 @@ def fit(args, fitter, ws, dofit=True):
         npoi = int(fitter.poi_model.npoi)
         noi_idx_in_x = np.asarray(fitter.indata.noiidxs, dtype=np.int64) + npoi
         poi_noi_idx = np.concatenate([np.arange(npoi, dtype=np.int64), noi_idx_in_x])
-        edmval, cov_rows = fitter.edmval_cov_rows_hessfree(grad, poi_noi_idx)
+        edmval, cov_rows = fitter.edmval_cov_rows_hessfree(
+            grad, poi_noi_idx, full_row=args.covFullRow
+        )
         logger.info(f"edmval: {edmval}")
 
         # Build a full-length variance vector with the POI+NOI entries
