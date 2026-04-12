@@ -161,6 +161,13 @@ class Fitter:
         # for prefit uncertainties instead.
         self.compute_cov = not getattr(options, "noHessian", False)
 
+        # Target estimated-distance-to-minimum tolerance for the
+        # is_linear Hessian-free CG solve, where the stopping criterion
+        # uses the Temple-bound lam_min: remaining_edm <= ||r||^2/(2*lam_min).
+        self.edmtol = getattr(options, "edmtol", 1e-8)
+        self.cov_rel_tol = getattr(options, "covRelTol", 1e-3)
+        self.covFullRow = getattr(options, "covFullRow", False)
+
         if options.covarianceFit and options.chisqFit:
             raise Exception(
                 'Use either "--covarianceFit" for chi-squared fit using covariance or "--chisqFit" for diagonal chi-squared fit'
@@ -943,7 +950,262 @@ class Fitter:
         else:
             return edmval_cov(grad, hess)
 
-    def edmval_cov_rows_hessfree(self, grad, row_indices, rtol=1e-10, maxiter=None):
+    @staticmethod
+    def _cg_solve(
+        op,
+        b=None,
+        rtol=1e-8,
+        atol=0.0,
+        maxiter=None,
+        label="CG",
+        bound_only=False,
+        edmtol=None,
+        min_iter=5,
+        bound_rel_tol=0.5,
+        ncv=None,
+        diag_index=None,
+        cov_rel_tol=None,
+        lam_min_ext=None,
+    ):
+        """Hand-rolled CG solve of ``op @ x = b`` that tracks the
+        CG-Lanczos tridiagonal to produce a Temple-bound estimate of
+        ``lambda_min(H)``.
+
+        The Lanczos tridiagonal ``T_k`` is assembled from the CG
+        coefficients (alpha_k, beta_k). At each iteration the smallest
+        Ritz value ``theta_1`` and its Ritz residual
+        ``rho_1 = |beta_{k+1}| * |y_1[k-1]|`` are computed cheaply
+        from ``T_k``. For a symmetric positive-definite ``H`` with
+        ``sigma = 0`` as a known lower bound, the Temple bound gives
+
+            lambda_min >= theta_1 - rho_1**2 / theta_1
+
+        without requiring a second Ritz value or an isolation check.
+        The bound is valid (self-consistently confirms PD) whenever
+        the result is positive.
+
+        CG terminates when ``||r_k|| < max(rtol * ||b||, atol)`` or
+        after ``maxiter`` iterations. When ``bound_only=True``, CG
+        terminates as soon as a positive Temple bound is established
+        (using a fixed-seed random RHS vector internally so the result
+        is insensitive to the caller's ``b``).
+
+        When ``edmtol`` is set (for the is_linear quadratic-solve use
+        case), CG instead terminates when the estimated remaining
+        distance to the quadratic minimum drops below ``edmtol``,
+        using the Temple-bound ``lam_min`` estimate:
+
+            remaining_edm <= 0.5 * ||r_k||**2 / lam_min_bound
+
+        Returns ``(x, info, lam_min_bound, n_iter)`` where ``info`` is
+        0 on convergence and >0 if maxiter was reached. When
+        ``bound_only=True``, ``x`` is meaningless.
+        """
+        import scipy.linalg as _sla
+
+        n = op.shape[0]
+
+        if bound_only:
+            rng = np.random.default_rng(0)
+            b_np = rng.standard_normal(n).astype(np.float64)
+        else:
+            if b is None:
+                raise ValueError("b must be provided when bound_only=False")
+            b_np = np.asarray(b, dtype=np.float64)
+
+        x = np.zeros(n, dtype=np.float64)
+        r = b_np.copy()
+        rsold = float(np.dot(r, r))
+
+        if rsold == 0.0:
+            return x, 0, float("inf"), 0
+
+        bnorm = float(np.sqrt(rsold))
+        tol = max(rtol * bnorm, atol)
+
+        p = r.copy()
+
+        tridiag_diag = []
+        tridiag_offdiag = []
+
+        prev_alpha = None
+        prev_beta = None
+        lam_min_bound = float("inf")
+
+        if maxiter is None:
+            maxiter = n * 10
+
+        # Store normalized residuals (= Lanczos vectors) for
+        # reorthogonalization at every iteration. This prevents finite-
+        # precision orthogonality loss from inflating rho_1, keeping
+        # the Temple/KT bound reliable. When ncv is set, only the most
+        # recent ncv vectors are kept (analogous to ARPACK's ncv
+        # parameter), capping memory at O(ncv*n) and per-iteration
+        # reorth cost at O(ncv*n). When ncv is None, all vectors are
+        # kept (full reorthogonalization).
+        lanczos_Q = [r / bnorm]
+
+        info = 0
+        k = 0
+        for _ in range(maxiter):
+            k += 1
+            Ap = op.matvec(p)
+            pAp = float(np.dot(p, Ap))
+            if pAp <= 0.0:
+                raise ValueError(
+                    f"CG: p^T H p = {pAp:.3e} <= 0 at iter {k}; "
+                    "Hessian may not be positive-definite"
+                )
+            alpha = rsold / pAp
+            x += alpha * p
+            r -= alpha * Ap
+
+            # Reorthogonalization against stored Lanczos vectors.
+            for q_old in lanczos_Q:
+                r -= float(np.dot(q_old, r)) * q_old
+
+            rsnew = float(np.dot(r, r))
+            rnorm = float(np.sqrt(rsnew))
+
+            if rnorm > 0.0:
+                lanczos_Q.append(r / rnorm)
+                # Cap stored vectors at ncv (drop oldest).
+                if ncv is not None and len(lanczos_Q) > ncv:
+                    lanczos_Q = lanczos_Q[-ncv:]
+
+            # Build Lanczos tridiagonal from CG coefficients.
+            if prev_alpha is None:
+                tridiag_diag.append(1.0 / alpha)
+            else:
+                tridiag_diag.append(1.0 / alpha + prev_beta / prev_alpha)
+                tridiag_offdiag.append(float(np.sqrt(prev_beta)) / prev_alpha)
+
+            # CG beta (using the reorthogonalized residual norm)
+            beta = rsnew / rsold if rsnew > 0.0 else 0.0
+
+            # "Future" Lanczos off-diagonal for Ritz residual.
+            beta_next = float(np.sqrt(beta)) / alpha if beta > 0.0 else 0.0
+
+            # Two smallest Ritz values + Ritz residual from T_k.
+            diag_arr = np.asarray(tridiag_diag)
+            if len(tridiag_offdiag) > 0:
+                offdiag_arr = np.asarray(tridiag_offdiag)
+                n_ritz = min(2, len(diag_arr))
+                eigvals, eigvecs = _sla.eigh_tridiagonal(
+                    diag_arr,
+                    offdiag_arr,
+                    eigvals_only=False,
+                    select="i",
+                    select_range=(0, n_ritz - 1),
+                )
+                theta_1 = float(eigvals[0])
+                theta_2 = float(eigvals[1]) if n_ritz >= 2 else float("inf")
+                y1_last = float(eigvecs[-1, 0])
+            else:
+                theta_1 = float(diag_arr[0])
+                theta_2 = float("inf")
+                y1_last = 1.0
+
+            rho_1 = abs(beta_next * y1_last)
+
+            # Lambda_min lower bound using Bauer-Fike positivity as
+            # the validity gate, then Temple/Kato-Temple for a tighter
+            # correction.
+            #
+            # Gate: theta_1 > rho_1 (BF bound theta_1 - rho_1 > 0).
+            # At early iterations rho_1 > theta_1 (Ritz pair hasn't
+            # converged to lambda_min), so this self-rejects without
+            # needing history tracking or isolation checks.
+            #
+            # Correction (when gate passes):
+            #   Temple:      rho_1^2 / theta_1       (always < rho_1)
+            #   Kato-Temple: rho_1^2 / (theta_2 - theta_1)
+            # Take the smaller (tighter). Both are quadratically better
+            # than BF's linear rho_1 correction. The resulting bound
+            # theta_1 - corr is guaranteed positive since
+            # corr <= rho_1^2/theta_1 < rho_1 < theta_1.
+            lam_min_bound = float("inf")
+            if k >= min_iter and theta_1 > rho_1:
+                rho_sq = rho_1**2
+                temple_corr = rho_sq / theta_1
+                gap = theta_2 - theta_1
+                kt_corr = rho_sq / gap if gap > 0.0 else float("inf")
+                corr = min(temple_corr, kt_corr)
+                lam_min_bound = theta_1 - corr
+
+            edm_est = (
+                0.5 * rsnew / lam_min_bound
+                if np.isfinite(lam_min_bound) and lam_min_bound > 0.0
+                else float("inf")
+            )
+            logger.debug(
+                "%s: iter %4d  ||r|| = %.3e  ||x|| = %.6e  "
+                "theta_1 = %.6e  rho = %.3e  "
+                "lam_min >= %.6e  edm <= %.3e",
+                label,
+                k,
+                rnorm,
+                float(np.linalg.norm(x)),
+                theta_1,
+                rho_1,
+                lam_min_bound,
+                edm_est,
+            )
+
+            if bound_only and np.isfinite(lam_min_bound):
+                # Stop when (theta_1 - lam_min_bound) / theta_1 < bound_rel_tol,
+                # i.e. the Temple/KT correction is a small fraction of theta_1.
+                rel_corr = (theta_1 - lam_min_bound) / theta_1
+                if rel_corr < bound_rel_tol:
+                    break
+
+            if edmtol is not None and np.isfinite(lam_min_bound):
+                edm_bound = 0.5 * rsnew / lam_min_bound
+                if edm_bound < edmtol:
+                    logger.debug(
+                        "%s: edm bound %.3e < edmtol %.3e, stopping",
+                        label,
+                        edm_bound,
+                        edmtol,
+                    )
+                    break
+
+            # Covariance relative-error stopping criterion using an
+            # externally-supplied lam_min (from the edmval step).
+            # |error| <= ||r_k|| / lam_min; scale factor is either
+            # |x_k[diag_index]| (diagonal-only) or ||x_k|| (row-norm).
+            if cov_rel_tol is not None and lam_min_ext is not None:
+                if diag_index is not None:
+                    scale = abs(float(x[diag_index]))
+                else:
+                    scale = float(np.linalg.norm(x))
+                if scale > 0.0:
+                    rel_err = rnorm / (lam_min_ext * scale)
+                    if rel_err < cov_rel_tol:
+                        logger.debug(
+                            "%s: cov rel_err %.3e < %.3e, stopping",
+                            label,
+                            rel_err,
+                            cov_rel_tol,
+                        )
+                        break
+
+            if rnorm <= tol:
+                break
+
+            if rsnew == 0.0:
+                break
+
+            p = r + beta * p
+            prev_alpha = alpha
+            prev_beta = beta
+            rsold = rsnew
+        else:
+            info = k  # maxiter reached without convergence
+
+        return x, info, lam_min_bound, k
+
+    def edmval_cov_rows_hessfree(self, grad, row_indices, rtol=1e-8, maxiter=None):
         """Hessian-free edmval + selected rows of the covariance matrix.
 
         Used under --noHessian to avoid allocating the dense [npar, npar]
@@ -990,17 +1252,66 @@ class Fitter:
         op = _spla.LinearOperator((n, n), matvec=_hvp_np, dtype=dtype)
 
         grad_np = grad.numpy() if hasattr(grad, "numpy") else np.asarray(grad)
-        v, info = _spla.cg(op, grad_np, rtol=rtol, atol=0.0, maxiter=maxiter)
-        if info != 0:
-            raise ValueError(f"CG solver for edmval did not converge (info={info})")
-        edmval = 0.5 * float(np.dot(grad_np, v))
+
+        # Compute lam_min via bound_only CG (random RHS, stops as soon
+        # as a positive Temple bound is established). The edmval upper
+        # bound is then 0.5 * ||g||^2 / lam_min.
+        _, _, lam_min_bound, n_iter_bound = self._cg_solve(
+            op,
+            bound_only=True,
+            label="lam_min bound",
+        )
+        grad_norm_sq = float(np.dot(grad_np, grad_np))
+        if np.isfinite(lam_min_bound) and lam_min_bound > 0.0:
+            edmval = 0.5 * grad_norm_sq / lam_min_bound
+        else:
+            edmval = float("inf")
+        logger.info(
+            "edmval upper bound = %.6e (||g||^2 = %.6e, lam_min >= %.6e, "
+            "%d CG iterations for bound)",
+            edmval,
+            grad_norm_sq,
+            lam_min_bound,
+            n_iter_bound,
+        )
+
+        # Cov-row CG stopping: relative error on the diagonal element
+        # (default) or on the full row norm, using lam_min from the
+        # edmval step. |error| <= ||r_k|| / lam_min, so the relative
+        # error on a scale factor S is ||r_k|| / (lam_min * S).
+        # For diagonal-only: S = |c_k[i]|. For row-norm: S = ||c_k||.
+        cov_rel_tol = getattr(self, "cov_rel_tol", 1e-3)
+        cov_full_row = getattr(self, "covFullRow", False)
+        lam_min_ext = (
+            lam_min_bound
+            if np.isfinite(lam_min_bound) and lam_min_bound > 0.0
+            else None
+        )
+        if lam_min_ext is not None:
+            logger.info(
+                "cov-row CG: %s relative tol = %.3e, lam_min = %.6e",
+                "row-norm" if cov_full_row else "diagonal",
+                cov_rel_tol,
+                lam_min_ext,
+            )
+        else:
+            logger.info("cov-row CG: lam_min not available, using default rtol")
 
         row_indices = np.asarray(list(row_indices), dtype=np.int64)
         cov_rows = np.empty((len(row_indices), n), dtype=dtype)
         for k, i in enumerate(row_indices):
             e = np.zeros(n, dtype=dtype)
             e[int(i)] = 1.0
-            c, info = _spla.cg(op, e, rtol=rtol, atol=0.0, maxiter=maxiter)
+            c, info, _, n_iter_row = self._cg_solve(
+                op,
+                e,
+                rtol=rtol if lam_min_ext is None else 0.0,
+                maxiter=maxiter,
+                label=f"cov row {int(i)}",
+                cov_rel_tol=cov_rel_tol if lam_min_ext is not None else None,
+                lam_min_ext=lam_min_ext,
+                diag_index=None if cov_full_row else int(i),
+            )
             if info != 0:
                 raise ValueError(
                     f"CG solver for cov row {int(i)} did not converge (info={info})"
@@ -2432,18 +2743,23 @@ class Fitter:
     def fit(self):
         logger.info("Perform iterative fit")
 
+        eval_counts = {"loss_grad": 0, "hessp": 0, "hess": 0}
+
         def scipy_loss(xval):
+            eval_counts["loss_grad"] += 1
             self.x.assign(xval)
             val, grad = self.loss_val_grad()
             return val.__array__(), grad.__array__()
 
         def scipy_hessp(xval, pval):
+            eval_counts["hessp"] += 1
             self.x.assign(xval)
             p = tf.convert_to_tensor(pval)
             val, grad, hessp = self.loss_val_grad_hessp(p)
             return hessp.__array__()
 
         def scipy_hess(xval):
+            eval_counts["hess"] += 1
             self.x.assign(xval)
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
@@ -2490,6 +2806,13 @@ class Fitter:
             logger.debug(res)
 
         self.x.assign(xval)
+
+        logger.info(
+            "Iterative fit finished: %d loss_grad, %d hessp, %d hess evaluations",
+            eval_counts["loss_grad"],
+            eval_counts["hessp"],
+            eval_counts["hess"],
+        )
 
         return callback
 
@@ -2545,13 +2868,26 @@ class Fitter:
                     return hessp.numpy()
 
                 op = _spla.LinearOperator((n, n), matvec=_hvp_np, dtype=dtype)
-                dx_np, info = _spla.cg(op, -grad_np, rtol=1e-10, atol=0.0)
+
+                dx_np, info, lam_min_bound, n_cg_iter = self._cg_solve(
+                    op,
+                    -grad_np,
+                    rtol=0.0,
+                    atol=0.0,
+                    label="CG solve",
+                    edmtol=self.edmtol,
+                )
                 if info != 0:
                     raise ValueError(
                         f"CG solver did not converge (info={info}); the "
                         "Hessian may not be positive-definite or the "
                         "problem may be ill-conditioned"
                     )
+                logger.info(
+                    "Hessian-free CG: %d iterations, lam_min >= %.6e",
+                    n_cg_iter,
+                    lam_min_bound,
+                )
                 self.x.assign_add(tf.constant(dx_np, dtype=self.x.dtype))
 
             callback = None
