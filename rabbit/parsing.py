@@ -241,6 +241,30 @@ def common_parser():
         help="Don't compute the hessian of parameters",
     )
     parser.add_argument(
+        "--edmtol",
+        default=1e-8,
+        type=float,
+        help="Target estimated-distance-to-minimum tolerance for the "
+        "Hessian-free CG solve in the is_linear case (remaining edm "
+        "upper bound 0.5*||r||^2/lam_min < edmtol)",
+    )
+    parser.add_argument(
+        "--covRelTol",
+        default=1e-3,
+        type=float,
+        help="Relative tolerance on covariance elements for the "
+        "Hessian-free CG cov-row solves (default: 1e-3 = 0.1%% on "
+        "the diagonal variance; uses lam_min from the edmval step)",
+    )
+    parser.add_argument(
+        "--covFullRow",
+        default=False,
+        action="store_true",
+        help="Use the full row norm (instead of just the diagonal "
+        "element) as the scale factor for the cov-row relative "
+        "convergence criterion under --noHessian",
+    )
+    parser.add_argument(
         "--prefitUnconstrainedNuisanceUncertainty",
         default=0.0,
         type=float,
