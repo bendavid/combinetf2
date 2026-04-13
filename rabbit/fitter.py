@@ -1018,15 +1018,23 @@ class Fitter:
         if maxiter is None:
             maxiter = n * 10
 
-        # Store normalized residuals (= Lanczos vectors) for
-        # reorthogonalization at every iteration. This prevents finite-
-        # precision orthogonality loss from inflating rho_1, keeping
-        # the Temple/KT bound reliable. When ncv is set, only the most
-        # recent ncv vectors are kept (analogous to ARPACK's ncv
-        # parameter), capping memory at O(ncv*n) and per-iteration
-        # reorth cost at O(ncv*n). When ncv is None, all vectors are
-        # kept (full reorthogonalization).
-        lanczos_Q = [r / bnorm]
+        # Store normalized residuals (= Lanczos vectors) as rows of a
+        # 2D array for reorthogonalization at every iteration. This
+        # prevents finite-precision orthogonality loss from inflating
+        # rho_1, keeping the Temple/KT bound reliable. When ncv is set,
+        # only the most recent ncv vectors are kept (analogous to
+        # ARPACK's ncv parameter), capping memory at O(ncv*n) and
+        # per-iteration reorth cost at O(ncv*n). When ncv is None, all
+        # vectors are kept (full reorthogonalization).
+        #
+        # Using a contiguous 2D array (rows = vectors) lets the
+        # reorthogonalization run as a single BLAS GEMV (Q @ r) +
+        # GEMV (Q.T @ coeffs) instead of a Python loop of dot products.
+        # Preallocated buffer; nq tracks the active row count.
+        _q_capacity = min(maxiter, 128)
+        lanczos_Q = np.empty((_q_capacity, n), dtype=np.float64)
+        lanczos_Q[0] = r / bnorm
+        nq = 1
 
         info = 0
         k = 0
@@ -1044,17 +1052,30 @@ class Fitter:
             r -= alpha * Ap
 
             # Reorthogonalization against stored Lanczos vectors.
-            for q_old in lanczos_Q:
-                r -= float(np.dot(q_old, r)) * q_old
+            # Single batched BLAS GEMV pair: coeffs = Q @ r, r -= Q.T @ coeffs.
+            Q = lanczos_Q[:nq]
+            coeffs = Q @ r
+            r -= coeffs @ Q
 
             rsnew = float(np.dot(r, r))
             rnorm = float(np.sqrt(rsnew))
 
             if rnorm > 0.0:
-                lanczos_Q.append(r / rnorm)
-                # Cap stored vectors at ncv (drop oldest).
-                if ncv is not None and len(lanczos_Q) > ncv:
-                    lanczos_Q = lanczos_Q[-ncv:]
+                if ncv is not None and nq >= ncv:
+                    # Cap at ncv: shift oldest out, append at end.
+                    lanczos_Q[: ncv - 1] = lanczos_Q[1:ncv]
+                    lanczos_Q[ncv - 1] = r / rnorm
+                    nq = ncv
+                else:
+                    # Grow buffer if needed (double capacity).
+                    if nq >= lanczos_Q.shape[0]:
+                        new_buf = np.empty(
+                            (lanczos_Q.shape[0] * 2, n), dtype=np.float64
+                        )
+                        new_buf[:nq] = lanczos_Q[:nq]
+                        lanczos_Q = new_buf
+                    lanczos_Q[nq] = r / rnorm
+                    nq += 1
 
             # Build Lanczos tridiagonal from CG coefficients.
             if prev_alpha is None:
