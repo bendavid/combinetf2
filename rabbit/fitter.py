@@ -144,12 +144,18 @@ class Fitter:
         # for prefit uncertainties instead.
         self.compute_cov = not getattr(options, "noHessian", False)
 
-        # Target estimated-distance-to-minimum tolerance for the
-        # is_linear Hessian-free CG solve, where the stopping criterion
-        # uses the Temple-bound lam_min: remaining_edm <= ||r||^2/(2*lam_min).
         self.edmtol = getattr(options, "edmtol", 1e-8)
-        self.cov_rel_tol = getattr(options, "covRelTol", 1e-3)
-        self.covFullRow = getattr(options, "covFullRow", False)
+        self.diag_precondition = getattr(options, "diagPrecondition", False)
+        self.external_precondition = getattr(options, "externalPrecondition", False)
+        if self.diag_precondition and self.external_precondition:
+            logger.warning(
+                "--diagPrecondition has no effect when combined with "
+                "--externalPrecondition (diagonal-only augmentation of "
+                "the external Hessian can degrade conditioning when "
+                "H_binned has off-diagonal content). Using "
+                "--externalPrecondition alone."
+            )
+            self.diag_precondition = False
 
         if options.covarianceFit and options.chisqFit:
             raise Exception(
@@ -361,14 +367,19 @@ class Fitter:
         # one common regularization strength parameter
         self.tau = tf.Variable(1.0, trainable=True, name="tau", dtype=tf.float64)
 
-        # External likelihood terms (additive g^T x + 0.5 x^T H x
-        # contributions to the NLL). See rabbit.external_likelihood for
-        # the construction helper and the matching scalar evaluator.
-        self.external_terms = external_likelihood.build_tf_external_terms(
-            self.indata.external_terms,
+        # External likelihood term: a single combined contribution
+        # of the form g^T x_sub + 0.5 x_sub^T H x_sub added to the NLL.
+        # The TensorWriter combines all user-supplied contributions at
+        # write time.
+        self.external_term = external_likelihood.build_tf_external_term(
+            self.indata.external_term,
             self.parms,
             self.indata.dtype,
         )
+
+        # Optionally factorize the combined external Hessian and cache
+        # the Factor object for use as a CG preconditioner.
+        self._build_external_precond()
 
         # constraint minima for nuisance parameters
         self.theta0 = tf.Variable(
@@ -933,6 +944,193 @@ class Fitter:
         else:
             return edmval_cov(grad, hess)
 
+    def _build_external_precond(self):
+        """Extract the external Hessian matrix A and parameter indices.
+
+        Called at init time. Actual factorization is deferred to
+        :meth:`_ensure_external_precond_factor` (called lazily on first
+        use) so fitters that never run CG don't pay the cost.
+
+        Sets ``self.external_precond_spec`` to a dict with keys
+        ``kind``, ``A``, and ``indices``, or ``None`` if no external
+        preconditioner is available/requested.
+
+        ``self.external_precond`` (populated later) is the cached
+        factorized form used during CG iterations.
+        """
+        self.external_precond_spec = None
+        self.external_precond = None
+
+        if not getattr(self, "external_precondition", False):
+            return
+
+        raw = getattr(self.indata, "external_term", None)
+        if raw is None:
+            return
+        if raw["hess_dense"] is None and raw["hess_sparse"] is None:
+            return
+
+        parms_str = np.asarray(self.parms).astype(str)
+        parms_idx = {name: i for i, name in enumerate(parms_str)}
+        params = raw["params"]
+        indices = np.empty(len(params), dtype=np.int64)
+        for i, p in enumerate(params):
+            j = parms_idx.get(str(p), -1)
+            if j < 0:
+                raise RuntimeError(
+                    f"External preconditioner parameter '{p}' not found "
+                    "in fit parameter list"
+                )
+            indices[i] = j
+
+        if raw["hess_dense"] is not None:
+            kind = "dense"
+            A = np.asarray(raw["hess_dense"], dtype=np.float64)
+        else:
+            kind = "sparse"
+            # raw["hess_sparse"] is a tf.sparse.SparseTensor; build a
+            # scipy CSC from it for the Cholesky factorization.
+            import scipy.sparse as _sp
+
+            ht = raw["hess_sparse"]
+            sparse_indices = ht.indices.numpy()
+            sparse_values = ht.values.numpy()
+            n_sub = len(indices)
+            A = _sp.coo_matrix(
+                (
+                    sparse_values,
+                    (sparse_indices[:, 0], sparse_indices[:, 1]),
+                ),
+                shape=(n_sub, n_sub),
+            ).tocsc()
+
+        self.external_precond_spec = {
+            "kind": kind,
+            "A": A,
+            "indices": indices,
+        }
+
+    def _ensure_external_precond_factor(self):
+        """Factorize the external preconditioner (if requested) and
+        cache the solver. Does nothing if already cached or disabled.
+        """
+        spec = getattr(self, "external_precond_spec", None)
+        if spec is None:
+            return  # preconditioner disabled
+        if self.external_precond is not None:
+            return  # already factored
+
+        kind = spec["kind"]
+        A = spec["A"]
+        indices = spec["indices"]
+
+        if kind == "dense":
+            import scipy.linalg as _sla
+
+            logger.info(
+                "Factorizing external preconditioner (dense, %d params)",
+                len(indices),
+            )
+            t0 = time.time()
+            try:
+                c, lower = _sla.cho_factor(A, lower=True)
+            except Exception as e:
+                logger.warning(
+                    "Dense Cholesky of external preconditioner failed (%s); "
+                    "preconditioner disabled",
+                    e,
+                )
+                self.external_precond_spec = None
+                return
+            logger.info("  factored in %.1fs", time.time() - t0)
+
+            cho = (c, lower)
+            solver = lambda r_sub: _sla.cho_solve(cho, r_sub)
+        else:
+            try:
+                from sksparse.cholmod import cholesky as _cholmod_cholesky
+            except ImportError:
+                logger.warning(
+                    "scikit-sparse (CHOLMOD) not available; sparse "
+                    "external preconditioner disabled."
+                )
+                self.external_precond_spec = None
+                return
+
+            logger.info(
+                "Factorizing external preconditioner (sparse, %d params, " "%d nnz)",
+                len(indices),
+                A.nnz,
+            )
+            t0 = time.time()
+            try:
+                factor = _cholmod_cholesky(A)
+            except Exception as e:
+                logger.warning(
+                    "Sparse Cholesky of external preconditioner failed "
+                    "(%s); preconditioner disabled",
+                    e,
+                )
+                self.external_precond_spec = None
+                return
+            logger.info("  factored in %.1fs", time.time() - t0)
+
+            # factor.solve_A dispatches to CHOLMOD's internal optimized
+            # solve (permutation + triangular solves, all in C).
+            solver = factor.solve_A
+
+        self.external_precond = {
+            "kind": kind,
+            "indices": indices,
+            "solver": solver,
+        }
+
+    def _make_external_precond_apply(self):
+        """Return a function that applies M⁻¹ to a full-length vector r.
+
+        For parameters covered by the external Cholesky factor, invokes
+        the cached solver (cho_solve for dense, factor.solve_A for
+        sparse). For parameters not covered, z = r (identity).
+        """
+        if self.external_precond is None:
+            return None
+
+        solver = self.external_precond["solver"]
+        indices = self.external_precond["indices"]
+
+        def apply(r):
+            z = r.copy()
+            z[indices] = solver(r[indices])
+            return z
+
+        return apply
+
+    @staticmethod
+    def _estimate_hess_diag(op, n_probes=5, seed=42):
+        """Estimate diag(H) via Hutchinson's stochastic estimator.
+
+        Uses Rademacher (±1) probe vectors:
+            diag(H) ≈ (1/m) Σ z_i ⊙ (H z_i)
+
+        Returns a 1D array of diagonal estimates, clamped to be positive.
+        """
+        n = op.shape[0]
+        rng = np.random.default_rng(seed)
+        diag_acc = np.zeros(n, dtype=np.float64)
+        for _ in range(n_probes):
+            z = rng.choice([-1.0, 1.0], size=n).astype(np.float64)
+            Hz = op.matvec(z)
+            diag_acc += z * Hz
+        diag_acc /= n_probes
+        # Clamp to positive (small/negative entries get replaced with
+        # the mean of positive entries to avoid division by zero).
+        pos = diag_acc > 0.0
+        if pos.any():
+            diag_acc[~pos] = diag_acc[pos].mean()
+        else:
+            diag_acc[:] = 1.0
+        return diag_acc
+
     @staticmethod
     def _cg_solve(
         op,
@@ -942,47 +1140,23 @@ class Fitter:
         maxiter=None,
         label="CG",
         bound_only=False,
-        edmtol=None,
-        min_iter=5,
         bound_rel_tol=0.5,
-        ncv=None,
-        diag_index=None,
-        cov_rel_tol=None,
-        lam_min_ext=None,
+        precondition=True,
+        n_probes=5,
+        precond_diag=None,
+        precond_apply=None,
+        min_iter=5,
+        edmtol=None,
     ):
-        """Hand-rolled CG solve of ``op @ x = b`` that tracks the
-        CG-Lanczos tridiagonal to produce a Temple-bound estimate of
-        ``lambda_min(H)``.
+        """Jacobi-preconditioned CG solve of ``op @ x = b`` with
+        Lanczos tridiagonal tracking for a Temple-bound estimate of
+        ``lambda_min(M⁻¹H)``.
 
-        The Lanczos tridiagonal ``T_k`` is assembled from the CG
-        coefficients (alpha_k, beta_k). At each iteration the smallest
-        Ritz value ``theta_1`` and its Ritz residual
-        ``rho_1 = |beta_{k+1}| * |y_1[k-1]|`` are computed cheaply
-        from ``T_k``. For a symmetric positive-definite ``H`` with
-        ``sigma = 0`` as a known lower bound, the Temple bound gives
+        When ``bound_only=True``, CG runs with a fixed-seed random RHS
+        and terminates as soon as a valid lambda_min bound is established.
+        The returned ``x`` is meaningless in this mode.
 
-            lambda_min >= theta_1 - rho_1**2 / theta_1
-
-        without requiring a second Ritz value or an isolation check.
-        The bound is valid (self-consistently confirms PD) whenever
-        the result is positive.
-
-        CG terminates when ``||r_k|| < max(rtol * ||b||, atol)`` or
-        after ``maxiter`` iterations. When ``bound_only=True``, CG
-        terminates as soon as a positive Temple bound is established
-        (using a fixed-seed random RHS vector internally so the result
-        is insensitive to the caller's ``b``).
-
-        When ``edmtol`` is set (for the is_linear quadratic-solve use
-        case), CG instead terminates when the estimated remaining
-        distance to the quadratic minimum drops below ``edmtol``,
-        using the Temple-bound ``lam_min`` estimate:
-
-            remaining_edm <= 0.5 * ||r_k||**2 / lam_min_bound
-
-        Returns ``(x, info, lam_min_bound, n_iter)`` where ``info`` is
-        0 on convergence and >0 if maxiter was reached. When
-        ``bound_only=True``, ``x`` is meaningless.
+        Returns ``(x, info, lam_min_bound, n_iter)``.
         """
         import scipy.linalg as _sla
 
@@ -996,44 +1170,63 @@ class Fitter:
                 raise ValueError("b must be provided when bound_only=False")
             b_np = np.asarray(b, dtype=np.float64)
 
+        # --- Set up preconditioner ---
+        # Priority: user-provided apply fn > Jacobi diagonal > identity.
+        if precond_apply is not None:
+            apply_precond = precond_apply
+        elif precondition:
+            if precond_diag is not None:
+                hess_diag = precond_diag
+            else:
+                hess_diag = Fitter._estimate_hess_diag(op, n_probes=n_probes)
+                logger.debug(
+                    "%s: Jacobi diag estimated (%d probes), "
+                    "min=%.3e max=%.3e ratio=%.1f",
+                    label,
+                    n_probes,
+                    hess_diag.min(),
+                    hess_diag.max(),
+                    hess_diag.max() / hess_diag.min(),
+                )
+
+            def apply_precond(r):
+                return r / hess_diag
+
+        else:
+
+            def apply_precond(r):
+                return r.copy()
+
         x = np.zeros(n, dtype=np.float64)
         r = b_np.copy()
-        rsold = float(np.dot(r, r))
 
-        if rsold == 0.0:
-            return x, 0, float("inf"), 0
-
-        bnorm = float(np.sqrt(rsold))
+        bnorm = float(np.sqrt(np.dot(r, r)))
         tol = max(rtol * bnorm, atol)
-
-        p = r.copy()
-
-        tridiag_diag = []
-        tridiag_offdiag = []
-
-        prev_alpha = None
-        prev_beta = None
-        lam_min_bound = float("inf")
 
         if maxiter is None:
             maxiter = n * 10
 
-        # Store normalized residuals (= Lanczos vectors) as rows of a
-        # 2D array for reorthogonalization at every iteration. This
-        # prevents finite-precision orthogonality loss from inflating
-        # rho_1, keeping the Temple/KT bound reliable. When ncv is set,
-        # only the most recent ncv vectors are kept (analogous to
-        # ARPACK's ncv parameter), capping memory at O(ncv*n) and
-        # per-iteration reorth cost at O(ncv*n). When ncv is None, all
-        # vectors are kept (full reorthogonalization).
-        #
-        # Using a contiguous 2D array (rows = vectors) lets the
-        # reorthogonalization run as a single BLAS GEMV (Q @ r) +
-        # GEMV (Q.T @ coeffs) instead of a Python loop of dot products.
-        # Preallocated buffer; nq tracks the active row count.
+        z = apply_precond(r)
+        rz = float(np.dot(r, z))
+        if rz == 0.0:
+            return x, 0, float("inf"), 0
+
+        p = z.copy()
+
+        tridiag_diag = []
+        tridiag_offdiag = []
+        prev_alpha = None
+        prev_beta = None
+        lam_min_bound = float("inf")
+
+        # Dual storage for M-orthogonal reorthogonalization.
         _q_capacity = min(maxiter, 128)
-        lanczos_Q = np.empty((_q_capacity, n), dtype=np.float64)
-        lanczos_Q[0] = r / bnorm
+        lanczos_R = np.empty((_q_capacity, n), dtype=np.float64)
+        lanczos_Z = np.empty((_q_capacity, n), dtype=np.float64)
+        lanczos_rz = np.empty(_q_capacity, dtype=np.float64)
+        lanczos_R[0] = r
+        lanczos_Z[0] = z
+        lanczos_rz[0] = rz
         nq = 1
 
         info = 0
@@ -1047,35 +1240,42 @@ class Fitter:
                     f"CG: p^T H p = {pAp:.3e} <= 0 at iter {k}; "
                     "Hessian may not be positive-definite"
                 )
-            alpha = rsold / pAp
+            alpha = rz / pAp
             x += alpha * p
             r -= alpha * Ap
 
-            # Reorthogonalization against stored Lanczos vectors.
-            # Single batched BLAS GEMV pair: coeffs = Q @ r, r -= Q.T @ coeffs.
-            Q = lanczos_Q[:nq]
-            coeffs = Q @ r
-            r -= coeffs @ Q
+            z = apply_precond(r)
+            rz_new = float(np.dot(r, z))
 
-            rsnew = float(np.dot(r, r))
-            rnorm = float(np.sqrt(rsnew))
+            # M-orthogonal reorthogonalization: project out stored
+            # (r_j, z_j) pairs using c_j = r^T z_j / (r_j^T z_j),
+            # then subtract c_j r_j from r and c_j z_j from z.
+            # This maintains z = M⁻¹r by linearity.
+            Zq = lanczos_Z[:nq]
+            coeffs = Zq @ r / lanczos_rz[:nq]
+            r -= coeffs @ lanczos_R[:nq]
+            z -= coeffs @ Zq
+            rz_new = float(np.dot(r, z))
 
-            if rnorm > 0.0:
-                if ncv is not None and nq >= ncv:
-                    # Cap at ncv: shift oldest out, append at end.
-                    lanczos_Q[: ncv - 1] = lanczos_Q[1:ncv]
-                    lanczos_Q[ncv - 1] = r / rnorm
-                    nq = ncv
-                else:
-                    # Grow buffer if needed (double capacity).
-                    if nq >= lanczos_Q.shape[0]:
-                        new_buf = np.empty(
-                            (lanczos_Q.shape[0] * 2, n), dtype=np.float64
-                        )
-                        new_buf[:nq] = lanczos_Q[:nq]
-                        lanczos_Q = new_buf
-                    lanczos_Q[nq] = r / rnorm
-                    nq += 1
+            rnorm = float(np.sqrt(np.dot(r, r)))
+
+            # Store reorthogonalized (r, z) pair.
+            if rz_new > 0.0:
+                if nq >= lanczos_R.shape[0]:
+                    new_cap = lanczos_R.shape[0] * 2
+                    new_R = np.empty((new_cap, n), dtype=np.float64)
+                    new_R[:nq] = lanczos_R[:nq]
+                    lanczos_R = new_R
+                    new_Z = np.empty((new_cap, n), dtype=np.float64)
+                    new_Z[:nq] = lanczos_Z[:nq]
+                    lanczos_Z = new_Z
+                    new_rz = np.empty(new_cap, dtype=np.float64)
+                    new_rz[:nq] = lanczos_rz[:nq]
+                    lanczos_rz = new_rz
+                lanczos_R[nq] = r
+                lanczos_Z[nq] = z
+                lanczos_rz[nq] = rz_new
+                nq += 1
 
             # Build Lanczos tridiagonal from CG coefficients.
             if prev_alpha is None:
@@ -1084,10 +1284,7 @@ class Fitter:
                 tridiag_diag.append(1.0 / alpha + prev_beta / prev_alpha)
                 tridiag_offdiag.append(float(np.sqrt(prev_beta)) / prev_alpha)
 
-            # CG beta (using the reorthogonalized residual norm)
-            beta = rsnew / rsold if rsnew > 0.0 else 0.0
-
-            # "Future" Lanczos off-diagonal for Ritz residual.
+            beta = rz_new / rz if rz_new > 0.0 else 0.0
             beta_next = float(np.sqrt(beta)) / alpha if beta > 0.0 else 0.0
 
             # Two smallest Ritz values + Ritz residual from T_k.
@@ -1112,22 +1309,7 @@ class Fitter:
 
             rho_1 = abs(beta_next * y1_last)
 
-            # Lambda_min lower bound using Bauer-Fike positivity as
-            # the validity gate, then Temple/Kato-Temple for a tighter
-            # correction.
-            #
-            # Gate: theta_1 > rho_1 (BF bound theta_1 - rho_1 > 0).
-            # At early iterations rho_1 > theta_1 (Ritz pair hasn't
-            # converged to lambda_min), so this self-rejects without
-            # needing history tracking or isolation checks.
-            #
-            # Correction (when gate passes):
-            #   Temple:      rho_1^2 / theta_1       (always < rho_1)
-            #   Kato-Temple: rho_1^2 / (theta_2 - theta_1)
-            # Take the smaller (tighter). Both are quadratically better
-            # than BF's linear rho_1 correction. The resulting bound
-            # theta_1 - corr is guaranteed positive since
-            # corr <= rho_1^2/theta_1 < rho_1 < theta_1.
+            # Lambda_min lower bound via BF + Temple/Kato-Temple.
             lam_min_bound = float("inf")
             if k >= min_iter and theta_1 > rho_1:
                 rho_sq = rho_1**2
@@ -1137,73 +1319,52 @@ class Fitter:
                 corr = min(temple_corr, kt_corr)
                 lam_min_bound = theta_1 - corr
 
-            edm_est = (
-                0.5 * rsnew / lam_min_bound
+            # Preconditioned edm bound: edm <= 0.5 * (r^T z) / lam_min(M⁻¹H)
+            edm_bound = (
+                0.5 * rz_new / lam_min_bound
                 if np.isfinite(lam_min_bound) and lam_min_bound > 0.0
                 else float("inf")
             )
+
             logger.debug(
-                "%s: iter %4d  ||r|| = %.3e  ||x|| = %.6e  "
+                "%s: iter %4d  ||r|| = %.3e  rtol = %.3e  ||x|| = %.6e  "
                 "theta_1 = %.6e  rho = %.3e  "
                 "lam_min >= %.6e  edm <= %.3e",
                 label,
                 k,
                 rnorm,
+                rnorm / bnorm if bnorm > 0.0 else 0.0,
                 float(np.linalg.norm(x)),
                 theta_1,
                 rho_1,
                 lam_min_bound,
-                edm_est,
+                edm_bound,
             )
 
             if bound_only and np.isfinite(lam_min_bound):
-                # Stop when (theta_1 - lam_min_bound) / theta_1 < bound_rel_tol,
-                # i.e. the Temple/KT correction is a small fraction of theta_1.
                 rel_corr = (theta_1 - lam_min_bound) / theta_1
                 if rel_corr < bound_rel_tol:
                     break
 
-            if edmtol is not None and np.isfinite(lam_min_bound):
-                edm_bound = 0.5 * rsnew / lam_min_bound
-                if edm_bound < edmtol:
-                    logger.debug(
-                        "%s: edm bound %.3e < edmtol %.3e, stopping",
-                        label,
-                        edm_bound,
-                        edmtol,
-                    )
-                    break
-
-            # Covariance relative-error stopping criterion using an
-            # externally-supplied lam_min (from the edmval step).
-            # |error| <= ||r_k|| / lam_min; scale factor is either
-            # |x_k[diag_index]| (diagonal-only) or ||x_k|| (row-norm).
-            if cov_rel_tol is not None and lam_min_ext is not None:
-                if diag_index is not None:
-                    scale = abs(float(x[diag_index]))
-                else:
-                    scale = float(np.linalg.norm(x))
-                if scale > 0.0:
-                    rel_err = rnorm / (lam_min_ext * scale)
-                    if rel_err < cov_rel_tol:
-                        logger.debug(
-                            "%s: cov rel_err %.3e < %.3e, stopping",
-                            label,
-                            rel_err,
-                            cov_rel_tol,
-                        )
-                        break
+            if edmtol is not None and edm_bound < edmtol:
+                logger.debug(
+                    "%s: edm bound %.3e < edmtol %.3e, stopping",
+                    label,
+                    edm_bound,
+                    edmtol,
+                )
+                break
 
             if rnorm <= tol:
                 break
 
-            if rsnew == 0.0:
+            if rz_new == 0.0:
                 break
 
-            p = r + beta * p
+            p = z + beta * p
             prev_alpha = alpha
             prev_beta = beta
-            rsold = rsnew
+            rz = rz_new
         else:
             info = k  # maxiter reached without convergence
 
@@ -1218,30 +1379,13 @@ class Fitter:
             H v = grad        ->  edmval = 0.5 * grad^T v
             H c_i = e_i       ->  c_i is the i-th column/row of cov
 
-        iteratively via scipy's conjugate gradient, feeding it a
-        LinearOperator backed by self.loss_val_grad_hessp. The Hessian
-        must be positive-definite; that's the case for a converged NLL
-        minimum (including the purely-quadratic --is_linear case).
-
-        Parameters
-        ----------
-        grad : tf.Tensor or array-like, shape [npar]
-            Gradient at the current x, already computed by the caller.
-        row_indices : iterable of int
-            Parameter indices to compute covariance rows for. Typically
-            the POI indices [0, npoi) concatenated with the NOI indices
-            (npoi + noiidxs).
-        rtol : float
-            Relative residual tolerance passed to scipy.sparse.linalg.cg.
-        maxiter : int or None
-            Maximum CG iterations per solve; None lets scipy choose.
+        iteratively via preconditioned conjugate gradient, feeding it a
+        LinearOperator backed by self.loss_val_grad_hessp.
 
         Returns
         -------
         edmval : float
         cov_rows : np.ndarray, shape [len(row_indices), npar]
-            Row i is (H^{-1})[row_indices[i], :]; diag entries give the
-            variances for those parameters.
         """
         import scipy.sparse.linalg as _spla
 
@@ -1257,49 +1401,60 @@ class Fitter:
 
         grad_np = grad.numpy() if hasattr(grad, "numpy") else np.asarray(grad)
 
+        # Set up preconditioner. If external preconditioning is
+        # enabled, factorize the external Hessian now (passing the HVP
+        # operator so the Jacobi-diagonal augmentation can use it if
+        # --diagPrecondition is also set).
+        self._ensure_external_precond_factor()
+        precond_apply = self._make_external_precond_apply()
+        hess_diag = None
+        if precond_apply is not None:
+            logger.info("Using external Cholesky preconditioner for CG solves")
+        elif self.diag_precondition:
+            hess_diag = self._estimate_hess_diag(op)
+            logger.info(
+                "Jacobi preconditioner: diag min=%.3e max=%.3e ratio=%.1f",
+                hess_diag.min(),
+                hess_diag.max(),
+                hess_diag.max() / hess_diag.min(),
+            )
+
+        use_precond = precond_apply is not None or self.diag_precondition
+
         # Compute lam_min via bound_only CG (random RHS, stops as soon
-        # as a positive Temple bound is established). The edmval upper
-        # bound is then 0.5 * ||g||^2 / lam_min.
+        # as a valid bound is established). The edmval upper bound is
+        # then 0.5 * ||g||^2 / lam_min (unpreconditioned) or
+        # 0.5 * (g^T M⁻¹g) / lam_min(M⁻¹H) (preconditioned).
         _, _, lam_min_bound, n_iter_bound = self._cg_solve(
             op,
             bound_only=True,
             label="lam_min bound",
+            precondition=use_precond,
+            precond_diag=hess_diag,
+            precond_apply=precond_apply,
         )
-        grad_norm_sq = float(np.dot(grad_np, grad_np))
         if np.isfinite(lam_min_bound) and lam_min_bound > 0.0:
-            edmval = 0.5 * grad_norm_sq / lam_min_bound
+            if precond_apply is not None:
+                # Preconditioned (external Cholesky):
+                # edm <= 0.5 * (g^T M⁻¹g) / lam_min(M⁻¹H)
+                gz = precond_apply(grad_np)
+                edmval = 0.5 * float(np.dot(grad_np, gz)) / lam_min_bound
+            elif self.diag_precondition and hess_diag is not None:
+                # Preconditioned (Jacobi):
+                # edm <= 0.5 * (g^T M⁻¹g) / lam_min(M⁻¹H)
+                gz = grad_np / hess_diag
+                edmval = 0.5 * float(np.dot(grad_np, gz)) / lam_min_bound
+            else:
+                # Unpreconditioned: edm <= 0.5 * ||g||^2 / lam_min(H)
+                edmval = 0.5 * float(np.dot(grad_np, grad_np)) / lam_min_bound
         else:
             edmval = float("inf")
         logger.info(
-            "edmval upper bound = %.6e (||g||^2 = %.6e, lam_min >= %.6e, "
-            "%d CG iterations for bound)",
+            "edmval upper bound = %.6e (lam_min >= %.6e, %d CG iterations)",
             edmval,
-            grad_norm_sq,
             lam_min_bound,
             n_iter_bound,
         )
-
-        # Cov-row CG stopping: relative error on the diagonal element
-        # (default) or on the full row norm, using lam_min from the
-        # edmval step. |error| <= ||r_k|| / lam_min, so the relative
-        # error on a scale factor S is ||r_k|| / (lam_min * S).
-        # For diagonal-only: S = |c_k[i]|. For row-norm: S = ||c_k||.
-        cov_rel_tol = getattr(self, "cov_rel_tol", 1e-3)
-        cov_full_row = getattr(self, "covFullRow", False)
-        lam_min_ext = (
-            lam_min_bound
-            if np.isfinite(lam_min_bound) and lam_min_bound > 0.0
-            else None
-        )
-        if lam_min_ext is not None:
-            logger.info(
-                "cov-row CG: %s relative tol = %.3e, lam_min = %.6e",
-                "row-norm" if cov_full_row else "diagonal",
-                cov_rel_tol,
-                lam_min_ext,
-            )
-        else:
-            logger.info("cov-row CG: lam_min not available, using default rtol")
 
         row_indices = np.asarray(list(row_indices), dtype=np.int64)
         cov_rows = np.empty((len(row_indices), n), dtype=dtype)
@@ -1309,12 +1464,12 @@ class Fitter:
             c, info, _, n_iter_row = self._cg_solve(
                 op,
                 e,
-                rtol=rtol if lam_min_ext is None else 0.0,
+                rtol=rtol,
                 maxiter=maxiter,
                 label=f"cov row {int(i)}",
-                cov_rel_tol=cov_rel_tol if lam_min_ext is not None else None,
-                lam_min_ext=lam_min_ext,
-                diag_index=None if cov_full_row else int(i),
+                precondition=use_precond,
+                precond_diag=hess_diag,
+                precond_apply=precond_apply,
             )
             if info != 0:
                 raise ValueError(
@@ -2614,7 +2769,7 @@ class Fitter:
     def _compute_external_nll(self):
         """Sum of external likelihood term contributions: sum_i (g_i^T x_sub + 0.5 x_sub^T H_i x_sub)."""
         return external_likelihood.compute_external_nll(
-            self.external_terms, self.x, self.indata.dtype
+            self.external_term, self.x, self.indata.dtype
         )
 
     def _compute_nll(self, profile=True, full_nll=False):
@@ -2895,13 +3050,19 @@ class Fitter:
 
                 op = _spla.LinearOperator((n, n), matvec=_hvp_np, dtype=dtype)
 
+                self._ensure_external_precond_factor()
+                precond_apply = self._make_external_precond_apply()
+                use_precond = precond_apply is not None or self.diag_precondition
+                if precond_apply is not None:
+                    logger.info("Using external Cholesky preconditioner for CG solve")
                 dx_np, info, lam_min_bound, n_cg_iter = self._cg_solve(
                     op,
                     -grad_np,
                     rtol=0.0,
-                    atol=0.0,
                     label="CG solve",
                     edmtol=self.edmtol,
+                    precondition=use_precond,
+                    precond_apply=precond_apply,
                 )
                 if info != 0:
                     raise ValueError(
