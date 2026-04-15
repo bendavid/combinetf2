@@ -269,17 +269,10 @@ def common_parser():
         "--covRelTol",
         default=1e-3,
         type=float,
-        help="Relative tolerance on covariance elements for the "
-        "Hessian-free CG cov-row solves (default: 1e-3 = 0.1%% on "
-        "the diagonal variance; uses lam_min from the edmval step)",
-    )
-    parser.add_argument(
-        "--covFullRow",
-        default=False,
-        action="store_true",
-        help="Use the full row norm (instead of just the diagonal "
-        "element) as the scale factor for the cov-row relative "
-        "convergence criterion under --noHessian",
+        help="Relative tolerance on diagonal covariance elements "
+        "(variances) for the Hessian-free CG cov-row solves. Uses "
+        "the edm bound via Cauchy-Schwarz: "
+        "|c[i] - c*[i]|/c*[i] <= sqrt(2*edm/c[i]).",
     )
     parser.add_argument(
         "--prefitUnconstrainedNuisanceUncertainty",
