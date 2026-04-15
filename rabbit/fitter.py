@@ -125,12 +125,10 @@ class Fitter:
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
         # jitCompile accepts "auto" (the default), "on", or "off".
         # True / False from programmatic callers are accepted as
-        # aliases for "on" / "off". The tri-state is resolved to the
-        # final boolean self.jit_compile right here, using the only
-        # runtime condition it can depend on: whether the input is
-        # sparse. Sparse mode uses SparseMatrixMatMul which has no
-        # XLA kernel, so "auto" silently disables jit and "on" warns
-        # and falls back.
+        # aliases for "on" / "off". The tri-state is finally resolved
+        # to the plain boolean self.jit_compile below, once
+        # self.external_term is available (sparse-external-Hessian
+        # terms also force jit off, see `_resolve_jit_compile`).
         _jit_opt = getattr(options, "jitCompile", "auto")
         if _jit_opt is True:
             _jit_opt = "on"
@@ -140,20 +138,7 @@ class Fitter:
             raise ValueError(
                 f"jitCompile must be one of 'auto', 'on', 'off'; got {_jit_opt!r}"
             )
-        if _jit_opt == "off":
-            self.jit_compile = False
-        elif _jit_opt == "on":
-            if self.indata.sparse:
-                logger.warning(
-                    "--jitCompile=on requested but input data is sparse; "
-                    "XLA has no kernel for the sparse matmul ops used in "
-                    "sparse mode, so jit_compile will be disabled."
-                )
-                self.jit_compile = False
-            else:
-                self.jit_compile = True
-        else:  # "auto"
-            self.jit_compile = not self.indata.sparse
+        self._jit_opt = _jit_opt
         # When --noHessian is requested the postfit Hessian is never
         # computed, so the dense [npar, npar] covariance matrix should
         # not be allocated. self.cov is set to None in that case and
@@ -394,6 +379,39 @@ class Fitter:
             self.parms,
             self.indata.dtype,
         )
+
+        # Now that self.external_term is available, resolve the
+        # jitCompile tri-state to the final boolean self.jit_compile.
+        # SparseMatrixMatMul has no XLA kernel, so any tf.function
+        # that calls sm.matmul cannot be jit-compiled. That happens
+        # both in sparse-template mode (_compute_yields_noBBB) and
+        # in dense-template mode when the external likelihood carries
+        # a sparse Hessian (compute_external_nll via sm.matmul).
+        sparse_external = (
+            self.external_term is not None
+            and self.external_term.get("hess_csr") is not None
+        )
+        sparse_required = self.indata.sparse or sparse_external
+        if self._jit_opt == "off":
+            self.jit_compile = False
+        elif self._jit_opt == "on":
+            if sparse_required:
+                reason = (
+                    "input data is sparse"
+                    if self.indata.sparse
+                    else "external likelihood term has a sparse Hessian"
+                )
+                logger.warning(
+                    "--jitCompile=on requested but %s; XLA has no kernel "
+                    "for the sparse matmul ops used in this configuration, "
+                    "so jit_compile will be disabled.",
+                    reason,
+                )
+                self.jit_compile = False
+            else:
+                self.jit_compile = True
+        else:  # "auto"
+            self.jit_compile = not sparse_required
 
         # Optionally factorize the combined external Hessian and cache
         # the Factor object for use as a CG preconditioner.
@@ -1122,6 +1140,71 @@ class Fitter:
             return z
 
         return apply
+
+    def saturated_external_nll(self):
+        """Return the saturated-model contribution from the external
+        likelihood term, L_ext(θ*_sat), where θ*_sat is the minimum of
+        the (constraint + external) NLL over the nuisance parameters
+        covered by the external term, assuming all of those parameters
+        are declared constrained=False (i.e. have no internal Gaussian
+        prior).
+
+        For that case θ*_sat = -H_ext⁻¹ g and the minimum value of the
+        external quadratic is
+
+            L_ext(θ*_sat) = -0.5 * g^T H_ext⁻¹ g
+
+        which is computed via a single solve with the cached Cholesky
+        factor. Requires --externalPrecondition so that the factor is
+        available; otherwise a warning is logged and None is returned.
+
+        Returns None (with a warning) if (a) the external factor is
+        unavailable, or (b) any external parameter is internally
+        constrained — the simple formula doesn't apply without also
+        factorizing (I_W + H_ext).
+        """
+        if self.external_term is None:
+            return 0.0
+        # Lazily build the Cholesky factor if it hasn't been built yet
+        # (e.g. when called outside of a CG solve).
+        if self.external_precond is None:
+            self._ensure_external_precond_factor()
+        if self.external_precond is None:
+            logger.warning(
+                "saturated_external_nll: no external Cholesky factor "
+                "available (pass --externalPrecondition to enable the "
+                "saturated-model correction). Returning None."
+            )
+            return None
+
+        # Check that all external params are unconstrained. The formula
+        # is only exact in that case; warn and bail out otherwise.
+        ext_params = {str(p) for p in self.indata.external_term["params"]}
+        constrained_names = {
+            s.decode() if isinstance(s, bytes) else str(s) for s in self.indata.systs
+        } - {
+            s.decode() if isinstance(s, bytes) else str(s)
+            for s in self.indata.systsnoconstraint
+        }
+        overlap = ext_params & constrained_names
+        if overlap:
+            logger.warning(
+                "saturated_external_nll: %d external parameter(s) are "
+                "internally constrained (e.g. %r). The simple "
+                "-0.5 g^T H_ext^{-1} g formula is not exact in that "
+                "case. Returning None.",
+                len(overlap),
+                next(iter(overlap)),
+            )
+            return None
+
+        solver = self.external_precond["solver"]
+        g_values = self.indata.external_term.get("grad_values")
+        if g_values is None:
+            return 0.0
+        g = np.asarray(g_values, dtype=np.float64)
+        theta_star = solver(g)
+        return -0.5 * float(np.dot(g, theta_star))
 
     @staticmethod
     def _estimate_hess_diag(op, n_probes=5, seed=42):
@@ -2852,9 +2935,9 @@ class Fitter:
         # Build tf.function wrappers at instance construction time so that
         # jit_compile and the HVP autodiff mode can be controlled via fit
         # options without redefining the class. self.jit_compile has
-        # already been resolved to a plain bool in __init__ (tri-state
-        # "auto"/"on"/"off" collapsed against self.indata.sparse), so
-        # this body just reads it.
+        # already been resolved to a plain bool in __init__ (the tri-state
+        # "auto"/"on"/"off" is collapsed against the sparse-matmul
+        # detection there), so this body just reads it.
         jit = self.jit_compile
 
         def _loss_val(self):

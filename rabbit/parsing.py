@@ -217,10 +217,11 @@ def common_parser():
         type=str,
         choices=["auto", "on", "off"],
         help="Control XLA jit_compile=True on the loss/gradient/HVP tf.functions. "
-        "'auto' (default) enables jit_compile in dense mode and disables it in "
-        "sparse mode (where the CSR matmul kernels have no XLA implementation). "
-        "'on' forces jit_compile on (falling back to off with a warning in sparse "
-        "mode). 'off' disables jit_compile unconditionally.",
+        "'auto' (default) enables jit_compile when no sparse CSR matmul ops are "
+        "needed, and disables it otherwise (sparse template mode, or a sparse "
+        "external-likelihood Hessian). 'on' forces jit_compile on (falling back "
+        "to off with a warning when sparse matmul is structurally required). "
+        "'off' disables jit_compile unconditionally.",
     )
     parser.add_argument(
         "--chisqFit",

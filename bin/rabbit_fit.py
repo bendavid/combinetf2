@@ -530,7 +530,18 @@ def fit(args, fitter, ws, dofit=True):
         + n_ext_new
     )
 
-    chi2_val = 2.0 * nllvalreduced
+    # With an external likelihood term the saturated-model NLL is not
+    # zero: the nuisances settle at the minimum of L_c + L_ext rather
+    # than at the prior mean. Subtract that floor from reduced_nll so
+    # 2 * (reduced_nll - floor) = chi^2.
+    ext_nll_sat = fitter.saturated_external_nll()
+    if ext_nll_sat is None:
+        logger.warning(
+            "Saturated chi2: external-term floor could not be computed; "
+            "chi2 will be reported as NaN."
+        )
+        ext_nll_sat = np.nan
+    chi2_val = 2.0 * (nllvalreduced - ext_nll_sat)
     p_val = chi2.sf(chi2_val, ndfsat)
 
     logger.info("Saturated chi2:")
