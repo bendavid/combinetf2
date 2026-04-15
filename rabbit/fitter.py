@@ -1106,6 +1106,71 @@ class Fitter:
 
         return apply
 
+    def saturated_external_nll(self):
+        """Return the saturated-model contribution from the external
+        likelihood term, L_ext(θ*_sat), where θ*_sat is the minimum of
+        the (constraint + external) NLL over the nuisance parameters
+        covered by the external term, assuming all of those parameters
+        are declared constrained=False (i.e. have no internal Gaussian
+        prior).
+
+        For that case θ*_sat = -H_ext⁻¹ g and the minimum value of the
+        external quadratic is
+
+            L_ext(θ*_sat) = -0.5 * g^T H_ext⁻¹ g
+
+        which is computed via a single solve with the cached Cholesky
+        factor. Requires --externalPrecondition so that the factor is
+        available; otherwise a warning is logged and None is returned.
+
+        Returns None (with a warning) if (a) the external factor is
+        unavailable, or (b) any external parameter is internally
+        constrained — the simple formula doesn't apply without also
+        factorizing (I_W + H_ext).
+        """
+        if self.external_term is None:
+            return 0.0
+        # Lazily build the Cholesky factor if it hasn't been built yet
+        # (e.g. when called outside of a CG solve).
+        if self.external_precond is None:
+            self._ensure_external_precond_factor()
+        if self.external_precond is None:
+            logger.warning(
+                "saturated_external_nll: no external Cholesky factor "
+                "available (pass --externalPrecondition to enable the "
+                "saturated-model correction). Returning None."
+            )
+            return None
+
+        # Check that all external params are unconstrained. The formula
+        # is only exact in that case; warn and bail out otherwise.
+        ext_params = {str(p) for p in self.indata.external_term["params"]}
+        constrained_names = {
+            s.decode() if isinstance(s, bytes) else str(s) for s in self.indata.systs
+        } - {
+            s.decode() if isinstance(s, bytes) else str(s)
+            for s in self.indata.systsnoconstraint
+        }
+        overlap = ext_params & constrained_names
+        if overlap:
+            logger.warning(
+                "saturated_external_nll: %d external parameter(s) are "
+                "internally constrained (e.g. %r). The simple "
+                "-0.5 g^T H_ext^{-1} g formula is not exact in that "
+                "case. Returning None.",
+                len(overlap),
+                next(iter(overlap)),
+            )
+            return None
+
+        solver = self.external_precond["solver"]
+        g_values = self.indata.external_term.get("grad_values")
+        if g_values is None:
+            return 0.0
+        g = np.asarray(g_values, dtype=np.float64)
+        theta_star = solver(g)
+        return -0.5 * float(np.dot(g, theta_star))
+
     @staticmethod
     def _estimate_hess_diag(op, n_probes=5, seed=42):
         """Estimate diag(H) via Hutchinson's stochastic estimator.
@@ -2837,30 +2902,41 @@ class Fitter:
         # options without redefining the class.
         #
         # SparseMatrixMatMul has no XLA kernel, so any tf.function that
-        # uses it (via _compute_yields_noBBB in sparse mode) cannot be
-        # jit-compiled. Resolve the tri-state self.jit_compile setting:
+        # uses it cannot be jit-compiled. This affects both sparse-template
+        # mode (_compute_yields_noBBB) and dense-template mode with a
+        # sparse external Hessian (compute_external_nll via sm.matmul).
+        # Resolve the tri-state self.jit_compile setting:
         #
-        #   "auto" -> enable jit in dense mode, silently disable in
-        #             sparse mode (the default; sparse mode just can't
-        #             use it).
-        #   "on"   -> enable jit when possible. In sparse mode emit a
-        #             warning and disable, since the user explicitly
-        #             asked for it but it's structurally impossible.
+        #   "auto" -> enable jit when no sparse matmul is used; silently
+        #             disable otherwise.
+        #   "on"   -> enable jit when possible. Emit a warning and disable
+        #             when a sparse matmul is structurally required.
         #   "off"  -> never enable jit.
+        sparse_external = (
+            self.external_term is not None
+            and self.external_term.get("hess_csr") is not None
+        )
+        sparse_required = self.indata.sparse or sparse_external
         if self.jit_compile == "off":
             jit = False
         elif self.jit_compile == "on":
-            if self.indata.sparse:
+            if sparse_required:
+                reason = (
+                    "input data is sparse"
+                    if self.indata.sparse
+                    else "external likelihood term has a sparse Hessian"
+                )
                 logger.warning(
-                    "--jitCompile=on requested but input data is sparse; "
-                    "XLA has no kernel for the sparse matmul ops used in "
-                    "sparse mode, so jit_compile will be disabled."
+                    "--jitCompile=on requested but %s; XLA has no kernel "
+                    "for the sparse matmul ops used in this configuration, "
+                    "so jit_compile will be disabled.",
+                    reason,
                 )
                 jit = False
             else:
                 jit = True
         else:  # "auto"
-            jit = not self.indata.sparse
+            jit = not sparse_required
 
         def _loss_val(self):
             return self._compute_loss()
