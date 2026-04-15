@@ -497,9 +497,38 @@ def fit(args, fitter, ws, dofit=True):
 
     nllvalreduced = fitter.reduced_nll().numpy()
 
+    # External likelihood terms add a Gaussian-prior-like quadratic
+    # constraint on their parameter list. Each such parameter that is
+    # otherwise unconstrained (i.e. counted in nsystnoconstraint) gains
+    # an effective constraint back. Parameters that are already
+    # constrained by a Gaussian prior would be double-counted — so only
+    # external-covered parameters NOT already constrained contribute.
+    n_ext_new = 0
+    ext_term = getattr(fitter.indata, "external_term", None)
+    if ext_term is not None and ext_term.get("hess_dense") is None:
+        has_ext_hess = ext_term.get("hess_sparse") is not None
+    elif ext_term is not None:
+        has_ext_hess = True
+    else:
+        has_ext_hess = False
+    if has_ext_hess:
+        ext_params = {str(p) for p in ext_term["params"]}
+        all_systs = {
+            s.decode() if isinstance(s, bytes) else str(s) for s in fitter.indata.systs
+        }
+        noconstraint = {
+            s.decode() if isinstance(s, bytes) else str(s)
+            for s in fitter.indata.systsnoconstraint
+        }
+        constrained_systs = all_systs - noconstraint
+        n_ext_new = len(ext_params - constrained_systs)
+
     ndfsat = (
-        tf.size(fitter.nobs) - fitter.poi_model.npoi - fitter.indata.nsystnoconstraint
-    ).numpy()
+        tf.size(fitter.nobs).numpy()
+        - fitter.poi_model.npoi
+        - fitter.indata.nsystnoconstraint
+        + n_ext_new
+    )
 
     chi2_val = 2.0 * nllvalreduced
     p_val = chi2.sf(chi2_val, ndfsat)
