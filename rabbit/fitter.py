@@ -1241,7 +1241,7 @@ class Fitter:
         maxiter=None,
         label="CG",
         bound_only=False,
-        bound_rel_tol=0.5,
+        bound_rel_tol=0.1,
         precondition=True,
         n_probes=5,
         precond_diag=None,
@@ -1250,6 +1250,7 @@ class Fitter:
         edmtol=None,
         cov_rel_tol=None,
         diag_index=None,
+        lam_min_floor=None,
     ):
         """Jacobi-preconditioned CG solve of ``op @ x = b`` with
         Lanczos tridiagonal tracking for a Temple-bound estimate of
@@ -1258,6 +1259,13 @@ class Fitter:
         When ``bound_only=True``, CG runs with a fixed-seed random RHS
         and terminates as soon as a valid lambda_min bound is established.
         The returned ``x`` is meaningless in this mode.
+
+        ``lam_min_floor`` is an externally-supplied lower bound on
+        ``lambda_min(M⁻¹H)`` (e.g. from a previous ``bound_only`` call
+        on the same operator/preconditioner). It is combined with the
+        in-situ Lanczos estimate via ``max(...)``, so the edm / cov-row
+        stopping criteria get a useful bound immediately instead of
+        waiting for this call's own Lanczos to converge past ``min_iter``.
 
         Returns ``(x, info, lam_min_bound, n_iter)``.
         """
@@ -1422,10 +1430,17 @@ class Fitter:
                 corr = min(temple_corr, kt_corr)
                 lam_min_bound = theta_1 - corr
 
+            # Combine with any externally-supplied floor on lam_min(M⁻¹H)
+            # (e.g. from a prior bound_only call on the same operator).
+            # Both are lower bounds, so max() is the tighter one.
+            lam_min_effective = lam_min_bound
+            if lam_min_floor is not None and lam_min_floor > 0.0:
+                lam_min_effective = max(lam_min_effective, float(lam_min_floor))
+
             # Preconditioned edm bound: edm <= 0.5 * (r^T z) / lam_min(M⁻¹H)
             edm_bound = (
-                0.5 * rz_new / lam_min_bound
-                if np.isfinite(lam_min_bound) and lam_min_bound > 0.0
+                0.5 * rz_new / lam_min_effective
+                if np.isfinite(lam_min_effective) and lam_min_effective > 0.0
                 else float("inf")
             )
 
@@ -1459,25 +1474,25 @@ class Fitter:
                 break
 
             # Covariance-row relative-error stopping on the diagonal
-            # variance. For H c = e_i, Cauchy-Schwarz in the H-inner
-            # product gives
-            #   |c_k[i] - c*[i]|^2 <= 2 * edm * c*[i]
-            # hence
-            #   |c_k[i] - c*[i]| / c*[i] <= sqrt(2 * edm / c_k[i])
-            # This uses the existing edm bound (rigorous in the
-            # preconditioned case) — no separate lam_min(H) estimate
-            # needed.
+            # variance. For H c = e_i starting from c_0 = 0, CG gives
+            # c_k in K_k with (c_k - c*) H-orthogonal to K_k, so
+            # c_k^T H c_k = c_k[i] and hence
+            #   edm = f(c_k) - f(c*) = 0.5 * (c*[i] - c_k[i])
+            # exactly (CG approaches c*[i] monotonically from below).
+            # The absolute diagonal error is therefore 2 * edm, and a
+            # relative tolerance maps linearly (not quadratically) to
+            # the edm bound: stop when 2 * edm_bound < cov_rel_tol * c_k[i].
             if (
                 cov_rel_tol is not None
                 and diag_index is not None
                 and np.isfinite(edm_bound)
             ):
                 scale = abs(float(x[diag_index]))
-                if scale > 0.0 and 2.0 * edm_bound < cov_rel_tol**2 * scale:
+                if scale > 0.0 and 2.0 * edm_bound < cov_rel_tol * scale:
                     logger.debug(
                         "%s: cov rel_err %.3e < %.3e, stopping",
                         label,
-                        float(np.sqrt(2.0 * edm_bound / scale)),
+                        2.0 * edm_bound / scale,
                         cov_rel_tol,
                     )
                     break
@@ -1609,6 +1624,7 @@ class Fitter:
                 precond_apply=precond_apply,
                 cov_rel_tol=cov_rel_tol,
                 diag_index=int(i),
+                lam_min_floor=lam_min_bound,
             )
             if info != 0:
                 raise ValueError(
