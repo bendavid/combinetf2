@@ -193,11 +193,12 @@ class FitInputData:
 
             self.axis_procs = hist.axis.StrCategory(self.procs, name="processes")
 
-            # Load external likelihood terms (optional). See
-            # rabbit.external_likelihood for the per-entry dict schema.
-            from rabbit.external_likelihood import read_external_terms_from_h5
+            # Load the (single, combined) external likelihood term.
+            # The TensorWriter combines all user-supplied contributions
+            # at write time; see rabbit.external_likelihood.
+            from rabbit.external_likelihood import read_external_term_from_h5
 
-            self.external_terms = read_external_terms_from_h5(f.get("external_terms"))
+            self.external_term = read_external_term_from_h5(f.get("external_term"))
 
     @tf.function
     def expected_events_nominal(self):

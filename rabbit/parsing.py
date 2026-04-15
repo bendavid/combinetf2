@@ -249,6 +249,23 @@ def common_parser():
         "upper bound 0.5*||r||^2/lam_min < edmtol)",
     )
     parser.add_argument(
+        "--diagPrecondition",
+        default=False,
+        action="store_true",
+        help="Enable Jacobi (diagonal) preconditioning for the "
+        "Hessian-free CG solves under --noHessian. Ignored when "
+        "--externalPrecondition is also set.",
+    )
+    parser.add_argument(
+        "--externalPrecondition",
+        default=False,
+        action="store_true",
+        help="Enable preconditioning of the Hessian-free CG solves "
+        "using a Cholesky factorization of the combined external "
+        "likelihood Hessian. Requires scikit-sparse (CHOLMOD) for "
+        "sparse external Hessians.",
+    )
+    parser.add_argument(
         "--covRelTol",
         default=1e-3,
         type=float,

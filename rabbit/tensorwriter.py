@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from collections import defaultdict
 
 import h5py
@@ -2155,78 +2156,195 @@ class TensorWriter:
                 )
                 beta_variations = None
 
-        # Write external likelihood terms. Each term is written as a
-        # subgroup under "external_terms"; the reader iterates the
-        # subgroups directly, so no separate names list is needed.
+        # Combine all external likelihood terms into a single
+        # (gradient, Hessian, params) tuple and write once. The combined
+        # term is used for both the likelihood evaluation and (optionally,
+        # at fit time) as a CG preconditioner.
         if self.external_terms:
-            ext_group = f.create_group("external_terms")
-            for term in self.external_terms:
-                term_group = ext_group.create_group(term["name"])
-                params_ds = term_group.create_dataset(
-                    "params",
-                    [len(term["params"])],
-                    dtype=h5py.special_dtype(vlen=str),
-                    compression="gzip",
-                )
-                params_ds[...] = [str(p) for p in term["params"]]
-
-                if term["grad_values"] is not None:
-                    nbytes += h5pyutils_write.writeFlatInChunks(
-                        term["grad_values"],
-                        term_group,
-                        "grad_values",
-                        maxChunkBytes=self.chunkSize,
-                    )
-
-                if term["hess_dense"] is not None:
-                    nbytes += h5pyutils_write.writeFlatInChunks(
-                        term["hess_dense"],
-                        term_group,
-                        "hess_dense",
-                        maxChunkBytes=self.chunkSize,
-                    )
-                elif term["hess_sparse"] is not None:
-                    rows, cols, vals = term["hess_sparse"]
-                    n = len(term["params"])
-                    rows = np.asarray(rows, dtype=self.idxdtype)
-                    cols = np.asarray(cols, dtype=self.idxdtype)
-                    vals = np.asarray(vals, dtype=self.dtype)
-                    # Sort into canonical row-major order so the reader
-                    # (and downstream tf.sparse / CSR consumers) can skip
-                    # the reorder step. The fast path: if the input is
-                    # already canonical (typical when the source is a
-                    # SparseHist whose flat indices come in flat-index
-                    # order), skip the O(nnz log nnz) argsort entirely.
-                    # The check is a single vectorized O(nnz) pass and
-                    # is essentially free compared to the sort it avoids
-                    # (~50-150 s on 329M nnz).
-                    if rows.size > 1:
-                        drows = np.diff(rows)
-                        dcols = np.diff(cols)
-                        already_sorted = bool(
-                            np.all((drows > 0) | ((drows == 0) & (dcols >= 0)))
-                        )
-                        del drows, dcols
-                    else:
-                        already_sorted = True
-                    if not already_sorted:
-                        flat = np.ravel_multi_index((rows, cols), (n, n))
-                        sort_order = np.argsort(flat)
-                        del flat
-                        rows = rows[sort_order]
-                        cols = cols[sort_order]
-                        vals = vals[sort_order]
-                    indices = np.stack([rows, cols], axis=-1)
-                    nbytes += h5pyutils_write.writeSparse(
-                        indices,
-                        vals,
-                        (n, n),
-                        term_group,
-                        "hess_sparse",
-                        maxChunkBytes=self.chunkSize,
-                    )
+            nbytes += self._write_combined_external_term(f)
 
         logger.info(f"Total raw bytes in arrays = {nbytes}")
+
+    def _write_combined_external_term(self, f):
+        """Combine all external-likelihood-term contributions and write
+        a single ``external_term`` group containing the unified
+        (params, grad, hess) representation.
+
+        Returns the number of raw bytes written (excluding metadata).
+        """
+        # Build the combined parameter list, preserving first-occurrence order.
+        param_to_idx = {}
+        any_dense = False
+        for term in self.external_terms:
+            if term["hess_dense"] is not None:
+                any_dense = True
+            for p in term["params"]:
+                if p not in param_to_idx:
+                    param_to_idx[p] = len(param_to_idx)
+        n_total = len(param_to_idx)
+        if n_total == 0:
+            return 0
+
+        logger.debug(
+            "combining %d external likelihood terms into %d unique params "
+            "(dense=%s)",
+            len(self.external_terms),
+            n_total,
+            any_dense,
+        )
+
+        # Accumulate gradient (always dense, typically cheap).
+        t0 = time.time()
+        grad_total = np.zeros(n_total, dtype=np.float64)
+        for term in self.external_terms:
+            if term["grad_values"] is None:
+                continue
+            idx = np.array([param_to_idx[p] for p in term["params"]], dtype=np.int64)
+            np.add.at(
+                grad_total, idx, np.asarray(term["grad_values"], dtype=np.float64)
+            )
+        grad_nz = int(np.count_nonzero(grad_total))
+        logger.debug(
+            "  grad combined in %.2f s (%d / %d nonzero)",
+            time.time() - t0,
+            grad_nz,
+            n_total,
+        )
+
+        # Accumulate Hessian.
+        if any_dense:
+            t0 = time.time()
+            logger.debug(
+                "  assembling dense %d x %d Hessian (~%.2f GB)",
+                n_total,
+                n_total,
+                n_total * n_total * 8 / 1e9,
+            )
+            H = np.zeros((n_total, n_total), dtype=np.float64)
+            for term in self.external_terms:
+                if term["hess_dense"] is None and term["hess_sparse"] is None:
+                    continue
+                idx = np.array(
+                    [param_to_idx[p] for p in term["params"]], dtype=np.int64
+                )
+                if term["hess_dense"] is not None:
+                    H[np.ix_(idx, idx)] += np.asarray(
+                        term["hess_dense"], dtype=np.float64
+                    )
+                else:
+                    rows, cols, vals = term["hess_sparse"]
+                    gi = idx[np.asarray(rows, dtype=np.int64)]
+                    gj = idx[np.asarray(cols, dtype=np.int64)]
+                    np.add.at(H, (gi, gj), np.asarray(vals, dtype=np.float64))
+            logger.debug("  dense Hessian combined in %.2f s", time.time() - t0)
+            ext_group = f.create_group("external_term")
+            ext_group.attrs["kind"] = "dense"
+            params_ds = ext_group.create_dataset(
+                "params",
+                [n_total],
+                dtype=h5py.special_dtype(vlen=str),
+                compression="gzip",
+            )
+            params_ds[...] = [str(p) for p in param_to_idx.keys()]
+            nbytes = h5pyutils_write.writeFlatInChunks(
+                grad_total.astype(self.dtype),
+                ext_group,
+                "grad_values",
+                maxChunkBytes=self.chunkSize,
+            )
+            nbytes += h5pyutils_write.writeFlatInChunks(
+                H.astype(self.dtype),
+                ext_group,
+                "hess_dense",
+                maxChunkBytes=self.chunkSize,
+            )
+            return nbytes
+
+        # Sparse path: collect triplets, sum duplicates, sort to canonical order.
+        t0 = time.time()
+        rows_all = []
+        cols_all = []
+        vals_all = []
+        for term in self.external_terms:
+            if term["hess_sparse"] is None:
+                continue
+            idx = np.array([param_to_idx[p] for p in term["params"]], dtype=np.int64)
+            rows, cols, vals = term["hess_sparse"]
+            rows_all.append(idx[np.asarray(rows, dtype=np.int64)])
+            cols_all.append(idx[np.asarray(cols, dtype=np.int64)])
+            vals_all.append(np.asarray(vals, dtype=np.float64))
+
+        if rows_all:
+            rows = np.concatenate(rows_all)
+            cols = np.concatenate(cols_all)
+            vals = np.concatenate(vals_all)
+        else:
+            rows = np.zeros(0, dtype=np.int64)
+            cols = np.zeros(0, dtype=np.int64)
+            vals = np.zeros(0, dtype=np.float64)
+
+        import scipy.sparse as _sp
+
+        if rows.size > 0:
+            A = _sp.coo_matrix((vals, (rows, cols)), shape=(n_total, n_total)).tocsr()
+            A.sum_duplicates()  # merge overlapping entries from different terms
+            # Back to COO for the canonical-order sparse write used elsewhere.
+            coo = A.tocoo()
+            rows = coo.row.astype(self.idxdtype)
+            cols = coo.col.astype(self.idxdtype)
+            vals = coo.data.astype(self.dtype)
+        else:
+            rows = rows.astype(self.idxdtype)
+            cols = cols.astype(self.idxdtype)
+            vals = vals.astype(self.dtype)
+        logger.debug(
+            "  sparse Hessian combined in %.2f s (%d nnz)",
+            time.time() - t0,
+            rows.size,
+        )
+
+        # Ensure canonical row-major order (required by downstream CSR
+        # consumers — mirror the old per-term logic).
+        if rows.size > 1:
+            drows = np.diff(rows)
+            dcols = np.diff(cols)
+            already_sorted = bool(np.all((drows > 0) | ((drows == 0) & (dcols >= 0))))
+            del drows, dcols
+        else:
+            already_sorted = True
+        if not already_sorted:
+            flat = np.ravel_multi_index((rows, cols), (n_total, n_total))
+            sort_order = np.argsort(flat)
+            del flat
+            rows = rows[sort_order]
+            cols = cols[sort_order]
+            vals = vals[sort_order]
+
+        ext_group = f.create_group("external_term")
+        ext_group.attrs["kind"] = "sparse"
+        params_ds = ext_group.create_dataset(
+            "params",
+            [n_total],
+            dtype=h5py.special_dtype(vlen=str),
+            compression="gzip",
+        )
+        params_ds[...] = [str(p) for p in param_to_idx.keys()]
+        nbytes = h5pyutils_write.writeFlatInChunks(
+            grad_total.astype(self.dtype),
+            ext_group,
+            "grad_values",
+            maxChunkBytes=self.chunkSize,
+        )
+        indices = np.stack([rows, cols], axis=-1)
+        nbytes += h5pyutils_write.writeSparse(
+            indices,
+            vals,
+            (n_total, n_total),
+            ext_group,
+            "hess_sparse",
+            maxChunkBytes=self.chunkSize,
+        )
+        return nbytes
 
     def get_systsstandard(self):
         return list(common.natural_sort(self.systsstandard))
