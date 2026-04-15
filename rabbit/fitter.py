@@ -145,6 +145,7 @@ class Fitter:
         self.compute_cov = not getattr(options, "noHessian", False)
 
         self.edmtol = getattr(options, "edmtol", 1e-8)
+        self.cov_rel_tol = getattr(options, "covRelTol", 1e-3)
         self.diag_precondition = getattr(options, "diagPrecondition", False)
         self.external_precondition = getattr(options, "externalPrecondition", False)
         if self.diag_precondition and self.external_precondition:
@@ -1147,6 +1148,8 @@ class Fitter:
         precond_apply=None,
         min_iter=5,
         edmtol=None,
+        cov_rel_tol=None,
+        diag_index=None,
     ):
         """Jacobi-preconditioned CG solve of ``op @ x = b`` with
         Lanczos tridiagonal tracking for a Temple-bound estimate of
@@ -1355,6 +1358,30 @@ class Fitter:
                 )
                 break
 
+            # Covariance-row relative-error stopping on the diagonal
+            # variance. For H c = e_i, Cauchy-Schwarz in the H-inner
+            # product gives
+            #   |c_k[i] - c*[i]|^2 <= 2 * edm * c*[i]
+            # hence
+            #   |c_k[i] - c*[i]| / c*[i] <= sqrt(2 * edm / c_k[i])
+            # This uses the existing edm bound (rigorous in the
+            # preconditioned case) — no separate lam_min(H) estimate
+            # needed.
+            if (
+                cov_rel_tol is not None
+                and diag_index is not None
+                and np.isfinite(edm_bound)
+            ):
+                scale = abs(float(x[diag_index]))
+                if scale > 0.0 and 2.0 * edm_bound < cov_rel_tol**2 * scale:
+                    logger.debug(
+                        "%s: cov rel_err %.3e < %.3e, stopping",
+                        label,
+                        float(np.sqrt(2.0 * edm_bound / scale)),
+                        cov_rel_tol,
+                    )
+                    break
+
             if rnorm <= tol:
                 break
 
@@ -1456,6 +1483,16 @@ class Fitter:
             n_iter_bound,
         )
 
+        # Per-row CG: stop when the relative error on the diagonal
+        # covariance element c[i] (the variance of parameter i) drops
+        # below cov_rel_tol, using the rigorous bound
+        #   |c_k[i] - c*[i]| / c*[i] <= sqrt(2 * edm_bound / c_k[i])
+        # derived from Cauchy-Schwarz in the H-inner product. The edm
+        # bound is valid in both unpreconditioned and preconditioned
+        # cases, so no separate lam_min(H) estimate is needed.
+        cov_rel_tol = getattr(self, "cov_rel_tol", 1e-3)
+        logger.info("cov-row CG: diagonal relative tol = %.3e", cov_rel_tol)
+
         row_indices = np.asarray(list(row_indices), dtype=np.int64)
         cov_rows = np.empty((len(row_indices), n), dtype=dtype)
         for k, i in enumerate(row_indices):
@@ -1470,6 +1507,8 @@ class Fitter:
                 precondition=use_precond,
                 precond_diag=hess_diag,
                 precond_apply=precond_apply,
+                cov_rel_tol=cov_rel_tol,
+                diag_index=int(i),
             )
             if info != 0:
                 raise ValueError(
