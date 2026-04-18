@@ -150,6 +150,12 @@ class Fitter:
         self.cov_rel_tol = getattr(options, "covRelTol", 1e-3)
         self.diag_precondition = getattr(options, "diagPrecondition", False)
         self.external_precondition = getattr(options, "externalPrecondition", False)
+        self.tikhonov_likelihood = getattr(options, "tikhonovLikelihood", False)
+        self.use_minres = getattr(options, "useMinres", False)
+        self.minres_rtol = getattr(options, "minresRtol", 1e-6)
+        self.minres_null_threshold = getattr(options, "minresNullThreshold", None)
+        self.minres_acond_max = getattr(options, "minresAcondMax", None)
+        self.minres_maxxnorm = getattr(options, "minresMaxxnorm", None)
         if self.diag_precondition and self.external_precondition:
             logger.warning(
                 "--diagPrecondition has no effect when combined with "
@@ -159,6 +165,13 @@ class Fitter:
                 "--externalPrecondition alone."
             )
             self.diag_precondition = False
+        if self.tikhonov_likelihood and not self.external_precondition:
+            logger.warning(
+                "--tikhonovLikelihood has no effect without "
+                "--externalPrecondition (no beta is computed); "
+                "disabling."
+            )
+            self.tikhonov_likelihood = False
 
         if options.covarianceFit and options.chisqFit:
             raise Exception(
@@ -412,6 +425,13 @@ class Fitter:
                 self.jit_compile = True
         else:  # "auto"
             self.jit_compile = not sparse_required
+
+        # Tikhonov-in-likelihood shift. Stored as a tf.Variable so its
+        # value can be updated post-factorization without retracing the
+        # tf.functions that read it. Always allocated (the NLL path
+        # gates on the Python flag, so when disabled the Variable is
+        # simply unused).
+        self.tikhonov_beta = tf.Variable(0.0, dtype=self.indata.dtype, trainable=False)
 
         # Optionally factorize the combined external Hessian and cache
         # the Factor object for use as a CG preconditioner.
@@ -1049,6 +1069,17 @@ class Fitter:
     def _ensure_external_precond_factor(self):
         """Factorize the external preconditioner (if requested) and
         cache the solver. Does nothing if already cached or disabled.
+
+        Uses an automatic Tikhonov regularization with a beta retry
+        loop: the factor represents ``A + beta*I`` where ``beta`` is
+        grown by 100x per factorization failure, starting from a
+        noise-floor level ``sqrt(eps)*max|diag(A)|`` and capped at
+        ``1e-2*max|diag(A)|``. When ``--tikhonovLikelihood`` is set the
+        same ``beta`` is written into ``self.tikhonov_beta`` so that
+        :meth:`_compute_tikhonov_nll` adds the matching
+        ``0.5 * beta * ||x_sub||^2`` term to the NLL, making the
+        preconditioner an exact factorization of the regularized
+        Hessian.
         """
         spec = getattr(self, "external_precond_spec", None)
         if spec is None:
@@ -1060,30 +1091,71 @@ class Fitter:
         A = spec["A"]
         indices = spec["indices"]
 
+        eps = float(np.finfo(np.float64).eps)
+        if kind == "dense":
+            diag_abs_max = float(np.abs(np.diag(A)).max())
+        else:
+            diag_abs_max = float(np.abs(A.diagonal()).max())
+        diag_abs_max = max(diag_abs_max, 1.0)
+        # Start at sqrt(nnz)*eps*max|diag| to account for floating-point
+        # noise accumulated in sums over many nonzeros; cap at 1% of the
+        # dominant diagonal so the preconditioner isn't ruined on large
+        # but genuinely small eigenvalues.
+        beta = (
+            max(eps, eps * np.sqrt(float(getattr(A, "nnz", len(indices)))))
+            * diag_abs_max
+        )
+        beta_max = 1e-2 * diag_abs_max
+
         if kind == "dense":
             import scipy.linalg as _sla
 
             logger.info(
-                "Factorizing external preconditioner (dense, %d params)",
+                "Factorizing external preconditioner (dense, %d params, "
+                "initial beta=%.3e)",
                 len(indices),
+                beta,
             )
             t0 = time.time()
-            try:
-                c, lower = _sla.cho_factor(A, lower=True)
-            except Exception as e:
-                logger.warning(
-                    "Dense Cholesky of external preconditioner failed (%s); "
-                    "preconditioner disabled",
-                    e,
-                )
-                self.external_precond_spec = None
-                return
-            logger.info("  factored in %.1fs", time.time() - t0)
-
-            cho = (c, lower)
-            solver = lambda r_sub: _sla.cho_solve(cho, r_sub)
+            cho_pair = None
+            solver = None
+            while True:
+                try:
+                    A_beta = A + beta * np.eye(len(indices))
+                    c, lower = _sla.cho_factor(A_beta, lower=True)
+                    cho_pair = (c, lower)
+                    solver = lambda r_sub: _sla.cho_solve(cho_pair, r_sub)  # noqa: E731
+                    break
+                except Exception as e:
+                    if beta >= beta_max:
+                        logger.warning(
+                            "Dense Cholesky of external preconditioner "
+                            "failed at beta=%.3e (max %.3e): %s; disabling",
+                            beta,
+                            beta_max,
+                            e,
+                        )
+                        self.external_precond_spec = None
+                        return
+                    new_beta = min(beta * 100.0, beta_max)
+                    logger.info(
+                        "  dense Cholesky failed at beta=%.3e (%s); "
+                        "retrying at beta=%.3e",
+                        beta,
+                        e,
+                        new_beta,
+                    )
+                    beta = new_beta
+            logger.info(
+                "  factored in %.1fs (final beta=%.3e)",
+                time.time() - t0,
+                beta,
+            )
         else:
             try:
+                from sksparse.cholmod import (
+                    CholmodNotPositiveDefiniteError,
+                )
                 from sksparse.cholmod import cholesky as _cholmod_cholesky
             except ImportError:
                 logger.warning(
@@ -1094,22 +1166,49 @@ class Fitter:
                 return
 
             logger.info(
-                "Factorizing external preconditioner (sparse, %d params, " "%d nnz)",
+                "Factorizing external preconditioner (sparse, %d params, "
+                "%d nnz, initial beta=%.3e)",
                 len(indices),
                 A.nnz,
+                beta,
             )
             t0 = time.time()
-            try:
-                factor = _cholmod_cholesky(A)
-            except Exception as e:
-                logger.warning(
-                    "Sparse Cholesky of external preconditioner failed "
-                    "(%s); preconditioner disabled",
-                    e,
-                )
-                self.external_precond_spec = None
-                return
-            logger.info("  factored in %.1fs", time.time() - t0)
+            factor = None
+            while True:
+                try:
+                    factor = _cholmod_cholesky(A, beta=beta)
+                    break
+                except CholmodNotPositiveDefiniteError:
+                    if beta >= beta_max:
+                        logger.warning(
+                            "Sparse Cholesky of external preconditioner "
+                            "failed at beta=%.3e (max %.3e); disabling",
+                            beta,
+                            beta_max,
+                        )
+                        self.external_precond_spec = None
+                        return
+                    new_beta = min(beta * 100.0, beta_max)
+                    logger.info(
+                        "  CHOLMOD reported non-PD at beta=%.3e; retrying "
+                        "at beta=%.3e",
+                        beta,
+                        new_beta,
+                    )
+                    beta = new_beta
+                except Exception as e:
+                    logger.warning(
+                        "Sparse Cholesky of external preconditioner failed "
+                        "(%s); preconditioner disabled",
+                        e,
+                    )
+                    self.external_precond_spec = None
+                    return
+            logger.info(
+                "  factored in %.1fs (final beta=%.3e)",
+                time.time() - t0,
+                beta,
+            )
 
             # factor.solve_A dispatches to CHOLMOD's internal optimized
             # solve (permutation + triangular solves, all in C).
@@ -1119,7 +1218,21 @@ class Fitter:
             "kind": kind,
             "indices": indices,
             "solver": solver,
+            "beta": beta,
         }
+
+        # If the user asked for matching Tikhonov in the likelihood,
+        # push the just-determined beta into the tf.Variable read by
+        # _compute_tikhonov_nll. tf.Variable.assign doesn't retrace
+        # tf.functions that captured the Variable at trace time.
+        if self.tikhonov_likelihood:
+            self.tikhonov_beta.assign(float(beta))
+            logger.info(
+                "Adding Tikhonov term 0.5 * %.3e * ||x_sub||^2 to NLL "
+                "on %d external parameters (matching preconditioner)",
+                beta,
+                len(indices),
+            )
 
     def _make_external_precond_apply(self):
         """Return a function that applies M⁻¹ to a full-length vector r.
@@ -1361,11 +1474,18 @@ class Fitter:
             # M-orthogonal reorthogonalization: project out stored
             # (r_j, z_j) pairs using c_j = r^T z_j / (r_j^T z_j),
             # then subtract c_j r_j from r and c_j z_j from z.
-            # This maintains z = M⁻¹r by linearity.
+            # This maintains z = M⁻¹r by linearity. Apply twice
+            # (Bjorck's "twice is enough") for robustness — a single
+            # pass leaves orthogonality at ~eps level immediately but
+            # accumulates drift over long runs, producing spurious
+            # Ritz values that loosen the Temple lam_min bound.
+            Rq = lanczos_R[:nq]
             Zq = lanczos_Z[:nq]
-            coeffs = Zq @ r / lanczos_rz[:nq]
-            r -= coeffs @ lanczos_R[:nq]
-            z -= coeffs @ Zq
+            inv_rz = 1.0 / lanczos_rz[:nq]
+            for _pass in range(2):
+                coeffs = (Zq @ r) * inv_rz
+                r = r - coeffs @ Rq
+                z = z - coeffs @ Zq
             rz_new = float(np.dot(r, z))
 
             rnorm = float(np.sqrt(np.dot(r, r)))
@@ -1511,6 +1631,950 @@ class Fitter:
             info = k  # maxiter reached without convergence
 
         return x, info, lam_min_bound, k
+
+    @staticmethod
+    def _minres_solve(
+        op,
+        b,
+        rtol=1e-6,
+        atol=0.0,
+        maxiter=None,
+        label="MINRES",
+        precondition=True,
+        precond_apply=None,
+        min_iter=5,
+        edmtol=None,
+        callback=None,
+        lam_min_floor=None,
+    ):
+        """Paige-Saunders MINRES with preconditioning, inline Lanczos
+        tridiagonal tracking, and Temple/Kato-Temple lower bound on
+        ``lambda_min(M^-1 A)``.
+
+        Solves symmetric (possibly singular / indefinite) ``A x = b``.
+        For PD ``A`` the solution is unique; for PSD ``A`` with
+        ``b in range(A)`` MINRES returns the minimum-norm solution;
+        for ``b`` outside the range it returns the least-squares
+        solution.
+
+        Stopping criteria:
+          - ``||r|| / ||b||`` (both in M^-1 norm) ``< rtol``
+          - ``0.5 ||r||^2_{M^-1} / lam_min_bound < edmtol`` (when
+            Temple bound on ``lam_min`` has converged, same formula as
+            preconditioned CG).
+
+        ``lam_min_floor`` is an externally-supplied lower bound on
+        ``lambda_min(M^-1 A)`` (restricted to the range of A for
+        singular systems). It is combined with the in-situ Lanczos
+        estimate via ``max(...)``, so the edm stopping criterion
+        still fires when Temple itself cannot give a useful bound
+        (e.g., when the spectrum has tight near-null clusters so
+        ``theta_1`` drifts downward and ``rho_1`` stays large).
+
+        Returns ``(x, info, lam_min_bound, rnorm, n_iter)``.
+        """
+        import scipy.linalg as _sla
+
+        n = op.shape[0]
+        b_np = np.asarray(b, dtype=np.float64)
+
+        if precond_apply is not None:
+            apply_M = precond_apply
+        else:
+
+            def apply_M(r):
+                return r.copy()
+
+        x = np.zeros(n, dtype=np.float64)
+        r1 = np.zeros(n, dtype=np.float64)
+        r2 = b_np.copy()
+        y = apply_M(r2)
+        beta_sq = float(np.dot(r2, y))
+        if beta_sq < 0.0:
+            raise ValueError(f"{label}: preconditioner M is not positive definite")
+        beta = float(np.sqrt(beta_sq))
+        if beta == 0.0:
+            return x, 0, float("inf"), 0.0, 0
+
+        beta1 = beta
+        bnorm = beta1  # ||b|| in M^-1 norm
+        tol = max(rtol * bnorm, atol)
+
+        oldb = 0.0
+        w = np.zeros(n, dtype=np.float64)
+        w2 = np.zeros(n, dtype=np.float64)
+        cs = -1.0
+        sn = 0.0
+        dbar = 0.0
+        epsln = 0.0
+        phibar = beta1  # tracks M^-1 norm of residual after QR
+
+        # Inline Lanczos tridiagonal (preconditioned) for Temple bound.
+        tridiag_diag = []
+        tridiag_offdiag = []
+        lam_min_bound = float("inf")
+        theta_1 = float("nan")
+        rho_1 = float("nan")
+        rnorm = beta1
+
+        if maxiter is None:
+            maxiter = n * 4
+
+        # Dual storage for M-orthogonal reorthogonalization, mirroring
+        # the CG solver. Stores (r_j, z_j = M^-1 r_j, r_j^T z_j) triples
+        # so subsequent residuals can be projected against them in the
+        # M-inner-product; this prevents the Lanczos tridiagonal from
+        # being corrupted by accumulated floating-point drift (spurious
+        # eigenvalues / duplicate Ritz pairs), which would otherwise
+        # loosen the Temple lam_min bound over long runs.
+        _q_capacity = min(maxiter, 128)
+        lanczos_R = np.empty((_q_capacity, n), dtype=np.float64)
+        lanczos_Z = np.empty((_q_capacity, n), dtype=np.float64)
+        lanczos_rz = np.empty(_q_capacity, dtype=np.float64)
+        lanczos_R[0] = r2
+        lanczos_Z[0] = y
+        lanczos_rz[0] = beta_sq
+        nq = 1
+
+        _eps = float(np.finfo(np.float64).eps)
+        info = 0
+        k = 0
+
+        for _ in range(maxiter):
+            k += 1
+            s_inv = 1.0 / beta
+            v = s_inv * y
+
+            # Lanczos 3-term recurrence. We store unpreconditioned r
+            # residuals and recover v = M^-1 r / beta on the fly, which
+            # matches scipy's Paige-Saunders arrangement.
+            y = op.matvec(v)
+            if k >= 2:
+                y = y - (beta / oldb) * r1
+            alpha = float(np.dot(v, y))
+            y = y - (alpha / beta) * r2
+            r1 = r2
+            r2 = y
+            y = apply_M(y)
+
+            # M-orthogonal reorthogonalization against stored Lanczos
+            # pairs: project r2 against accumulated r_j using coeffs
+            # c_j = r^T z_j / (r_j^T z_j), then subtract the same
+            # coeffs * z_j from y. This preserves the z = M^-1 r
+            # relationship by linearity. Apply twice (Bjorck's
+            # "twice is enough") for robustness over long runs —
+            # single-pass Gram-Schmidt accumulates drift after many
+            # matvec ops and can cause spurious negative Ritz values.
+            Rq = lanczos_R[:nq]
+            Zq = lanczos_Z[:nq]
+            inv_rz = 1.0 / lanczos_rz[:nq]
+            for _pass in range(2):
+                coeffs = (Zq @ r2) * inv_rz
+                r2 = r2 - coeffs @ Rq
+                y = y - coeffs @ Zq
+
+            oldb = beta
+            beta_sq = float(np.dot(r2, y))
+            # Tolerance for distinguishing "M is not PD" from "residual
+            # hit machine precision and roundoff went slightly negative".
+            # Any |beta^2| at or below eps * largest_stored_rz is at
+            # floating-point noise level and means MINRES has converged
+            # to the full Krylov rank.
+            noise_tol = _eps * float(lanczos_rz[:nq].max()) if nq > 0 else _eps
+            if beta_sq < -noise_tol:
+                logger.warning(
+                    "%s: preconditioner not positive definite at iter %d "
+                    "(beta^2 = %.3e); stopping",
+                    label,
+                    k,
+                    beta_sq,
+                )
+                info = -1
+                break
+            if beta_sq <= noise_tol:
+                logger.debug(
+                    "%s: Lanczos reached precision limit at iter %d "
+                    "(beta^2 = %.3e <= %.3e); stopping",
+                    label,
+                    k,
+                    beta_sq,
+                    noise_tol,
+                )
+                break
+            beta = float(np.sqrt(beta_sq))
+
+            # Store the reorthogonalized (r, z) pair for future
+            # reorthogonalizations. Grow the buffers geometrically when
+            # needed, matching the CG solver's pattern.
+            if beta_sq > 0.0:
+                if nq >= lanczos_R.shape[0]:
+                    new_cap = lanczos_R.shape[0] * 2
+                    new_R = np.empty((new_cap, n), dtype=np.float64)
+                    new_R[:nq] = lanczos_R[:nq]
+                    lanczos_R = new_R
+                    new_Z = np.empty((new_cap, n), dtype=np.float64)
+                    new_Z[:nq] = lanczos_Z[:nq]
+                    lanczos_Z = new_Z
+                    new_rz = np.empty(new_cap, dtype=np.float64)
+                    new_rz[:nq] = lanczos_rz[:nq]
+                    lanczos_rz = new_rz
+                lanczos_R[nq] = r2
+                lanczos_Z[nq] = y
+                lanczos_rz[nq] = beta_sq
+                nq += 1
+
+            # Feed the Lanczos tridiagonal T_k: diag gets alpha_k, and
+            # offdiag (of length k-1) gets beta_k (the OLD beta, i.e.
+            # oldb after the update above).
+            tridiag_diag.append(alpha)
+            if k >= 2:
+                tridiag_offdiag.append(oldb)
+
+            # Apply the previous Givens rotation to the new column of T_k.
+            oldeps = epsln
+            delta = cs * dbar + sn * alpha
+            gbar = sn * dbar - cs * alpha
+            epsln = sn * beta
+            dbar = -cs * beta
+
+            # New plane rotation to zero the sub-diagonal against beta.
+            gamma = float(np.sqrt(gbar * gbar + beta * beta))
+            if gamma <= _eps:
+                # Lanczos breakdown. Clamp for numerical safety and stop.
+                logger.debug(
+                    "%s: Lanczos breakdown at iter %d (gamma=%.3e)",
+                    label,
+                    k,
+                    gamma,
+                )
+                gamma = _eps
+            cs = gbar / gamma
+            sn = beta / gamma
+            phi = cs * phibar
+            phibar = sn * phibar
+
+            # Solution update via w recurrence (Goldstein three-term).
+            denom = 1.0 / gamma
+            w1 = w2
+            w2 = w
+            w = (v - oldeps * w1 - delta * w2) * denom
+            x = x + phi * w
+
+            rnorm = abs(phibar)
+
+            # Temple / Kato-Temple lower bound on lam_min(M^-1 A) from
+            # the inline tridiagonal. Same derivation as in _cg_solve.
+            if k >= min_iter:
+                diag_arr = np.asarray(tridiag_diag)
+                if len(tridiag_offdiag) > 0:
+                    offdiag_arr = np.asarray(tridiag_offdiag)
+                    n_ritz = min(2, len(diag_arr))
+                    try:
+                        eigvals, eigvecs = _sla.eigh_tridiagonal(
+                            diag_arr,
+                            offdiag_arr,
+                            eigvals_only=False,
+                            select="i",
+                            select_range=(0, n_ritz - 1),
+                        )
+                        theta_1 = float(eigvals[0])
+                        theta_2 = float(eigvals[1]) if n_ritz >= 2 else float("inf")
+                        y1_last = float(eigvecs[-1, 0])
+                    except Exception:
+                        theta_1 = float(diag_arr.min())
+                        theta_2 = float("inf")
+                        y1_last = 1.0
+                else:
+                    theta_1 = float(diag_arr[0])
+                    theta_2 = float("inf")
+                    y1_last = 1.0
+                rho_1 = abs(beta * y1_last)
+                if theta_1 > rho_1:
+                    rho_sq = rho_1 * rho_1
+                    temple_corr = rho_sq / theta_1
+                    gap = theta_2 - theta_1
+                    kt_corr = rho_sq / gap if gap > 0.0 else float("inf")
+                    corr = min(temple_corr, kt_corr)
+                    lam_min_bound = theta_1 - corr
+                else:
+                    lam_min_bound = float("inf")
+
+            # Combine with any externally-supplied floor. Both are
+            # lower bounds on lam_min(M^-1 A), so max() is the tighter.
+            lam_min_effective = lam_min_bound
+            if lam_min_floor is not None and lam_min_floor > 0.0:
+                lam_min_effective = max(lam_min_effective, float(lam_min_floor))
+
+            # edm bound: 0.5 ||r||^2_{M^-1} / lam_min(M^-1 A).
+            edm_bound = (
+                0.5 * rnorm * rnorm / lam_min_effective
+                if np.isfinite(lam_min_effective) and lam_min_effective > 0.0
+                else float("inf")
+            )
+
+            logger.debug(
+                "%s: iter %4d  ||r||=%.3e  rtol=%.3e  ||x||=%.3e  "
+                "theta_1=%.3e  rho=%.3e  lam_min>=%.3e  edm<=%.3e",
+                label,
+                k,
+                rnorm,
+                rnorm / bnorm if bnorm > 0.0 else 0.0,
+                float(np.linalg.norm(x)),
+                theta_1,
+                rho_1,
+                lam_min_effective,
+                edm_bound,
+            )
+
+            if callback is not None:
+                callback(x, k, rnorm, lam_min_effective, edm_bound)
+
+            if edmtol is not None and edm_bound < edmtol:
+                logger.debug(
+                    "%s: edm bound %.3e < edmtol %.3e, stopping",
+                    label,
+                    edm_bound,
+                    edmtol,
+                )
+                break
+
+            if rnorm <= tol:
+                logger.debug(
+                    "%s: ||r||=%.3e <= tol %.3e, stopping",
+                    label,
+                    rnorm,
+                    tol,
+                )
+                break
+        else:
+            info = k  # maxiter reached without convergence
+
+        # Combine with any externally-supplied floor for the final
+        # returned value, since the caller may want the bound
+        # tightened even if the loop ended on rtol (Temple bound
+        # still inf in the tight-cluster case).
+        lam_min_final = lam_min_bound
+        if lam_min_floor is not None and lam_min_floor > 0.0:
+            lam_min_final = max(lam_min_final, float(lam_min_floor))
+
+        return x, info, lam_min_final, rnorm, k
+
+    @staticmethod
+    def _sym_givens(a, b):
+        """Symmetric Givens rotation used by MINRES-QLP.
+
+        Returns (c, s, r) such that
+            [ c  s] [a]   [r]
+            [-s  c] [b] = [0]
+        with r >= 0, matching Algorithm 1 of the Choi-Paige-Saunders
+        reference implementation.
+        """
+        if b == 0.0:
+            if a == 0.0:
+                c = 1.0
+            else:
+                c = np.sign(a)
+            s = 0.0
+            r = abs(a)
+        elif a == 0.0:
+            c = 0.0
+            s = np.sign(b)
+            r = abs(b)
+        elif abs(b) > abs(a):
+            t = a / b
+            s = np.sign(b) / np.sqrt(1.0 + t * t)
+            c = s * t
+            r = b / s
+        else:
+            t = b / a
+            c = np.sign(a) / np.sqrt(1.0 + t * t)
+            s = c * t
+            r = a / c
+        return float(c), float(s), float(r)
+
+    @staticmethod
+    def _minres_qlp_solve(
+        op,
+        b,
+        rtol=1e-6,
+        atol=0.0,
+        maxiter=None,
+        label="MINRES-QLP",
+        precondition=True,
+        precond_apply=None,
+        min_iter=5,
+        edmtol=None,
+        callback=None,
+        lam_min_floor=None,
+        null_threshold=None,
+        acond_max=None,
+        maxxnorm=1e7,
+    ):
+        """Paige-Saunders MINRES-QLP, ported from the Choi-Paige-Saunders
+        reference implementation (MATLAB/Python) with added preconditioning
+        via an explicit ``apply_M`` callable, M-orthogonal
+        reorthogonalization, a Temple/Kato-Temple lower bound on
+        ``lam_min(M^-1 A)`` restricted to the non-null subspace, and an
+        edm-based stopping criterion.
+
+        MINRES-QLP augments MINRES with a second set of right-plane
+        rotations that factor ``T_k = Q_k L_k P_k`` instead of MINRES's
+        ``T_k = Q_k R_k``. On a PD ``A`` the iterate agrees with MINRES
+        to machine precision; on a singular ``A`` with ``b`` in range it
+        converges to the minimum-length (pseudo-inverse) solution
+        without the precision loss MINRES suffers near-singular. The
+        algorithm transitions from the MINRES phase to the MINRES-QLP
+        phase when ``Acond = Anorm/gmin`` exceeds ``acond_max``.
+
+        Stopping criteria (Choi-Paige-Saunders / scipy.minres
+        semantics for ``rtol``):
+          - ``test1 = ||r|| / (||A|| ||x|| + ||b||) <= rtol`` — normwise
+            backward error.
+          - ``test2 = ||A r|| / (||A|| ||r||) <= rtol`` — normal-
+            equation residual (least-squares convergence).
+          - ``0.5 ||r||^2_{M^-1} / lam_min_bound < edmtol`` (when the
+            Temple bound on the non-null subspace is finite).
+          - ``||r|| <= atol`` if ``atol > 0``.
+          - ``Acond > 0.1/eps`` (terminal rank-deficient stop, matches
+            scipy.minres ``istop=4``).
+          - ``xnorm > maxxnorm`` (terminal solution-norm cap, matches
+            reference ``istop=6``; default ``maxxnorm = 1e7``).
+
+        Returns ``(x, info, lam_min_bound, rnorm, n_iter)``.
+        """
+        import scipy.linalg as _sla
+
+        SymGivens = Fitter._sym_givens
+        n = op.shape[0]
+        b_np = np.asarray(b, dtype=np.float64)
+
+        if precond_apply is not None:
+            apply_M = precond_apply
+        else:
+
+            def apply_M(r):
+                return r.copy()
+
+        _eps = float(np.finfo(np.float64).eps)
+        _tiny = float(np.finfo(np.float64).tiny)
+        # Switch threshold MINRES -> MINRES-QLP.
+        if acond_max is None:
+            acond_max = 1.0 / np.sqrt(_eps)  # ~ 6.7e7
+        # Terminal rank-deficient stop (matches reference Acondlim).
+        acond_stop = 0.1 / _eps  # ~ 4.5e14
+
+        # --- Lanczos / Krylov state (reference names) -----------------
+        # r2, r3 track the Lanczos residuals; z = apply_M(r2) is used
+        # for the preconditioned beta computation.
+        r1 = np.zeros(n, dtype=np.float64)
+        r2 = b_np.copy()
+        r3 = r2.copy()
+        beta1 = float(np.sqrt(np.dot(r2, apply_M(r2))))
+        if beta1 < 0:
+            raise ValueError(f"{label}: preconditioner M is not positive definite")
+        # z = M^-1 r2 used as the "r3" direction when preconditioning.
+        r3 = apply_M(r2)
+        beta1_sq = float(np.dot(r2, r3))
+        if beta1_sq < 0:
+            raise ValueError(f"{label}: preconditioner M is not positive definite")
+        beta1 = float(np.sqrt(beta1_sq))
+        bnorm = beta1
+
+        if beta1 == 0.0:
+            return (
+                np.zeros(n, dtype=np.float64),
+                0,
+                float("inf"),
+                0.0,
+                0,
+            )
+
+        # --- Scalar state --------------------------------------------
+        # Reference naming: phi is residual norm, tau is current-step
+        # projection, gama / gamal / gamal2 / gamal3 are the chain of
+        # left-rotated diagonals shifted through rotations.
+        beta = 0.0
+        betan = beta1
+        phi = beta1
+        tau = 0.0
+        taul = 0.0
+        taul2 = 0.0
+        cs = -1.0
+        sn = 0.0
+        cr1 = -1.0
+        sr1 = 0.0
+        cr2 = -1.0
+        sr2 = 0.0
+        dltan = 0.0
+        eplnn = 0.0
+        gama = 0.0
+        gamal = 0.0
+        gamal2 = 0.0
+        gamal3 = 0.0
+        eta = 0.0
+        etal = 0.0
+        etal2 = 0.0
+        vepln = 0.0
+        veplnl = 0.0
+        veplnl2 = 0.0
+        ul3 = 0.0
+        ul2 = 0.0
+        ul = 0.0
+        u = 0.0
+        gmin = 0.0
+        gminl = 0.0
+        Anorm = 0.0
+        Acond = 1.0
+        rnorm = betan
+        xnorm = 0.0
+        xl2norm = 0.0
+        # Saved-at-transition scalars (used on MINRES->QLP switch)
+        gama_QLP = 0.0
+        gamal_QLP = 0.0
+        vepln_QLP = 0.0
+        ul_QLP = 0.0
+        u_QLP = 0.0
+
+        x = np.zeros(n, dtype=np.float64)
+        w = np.zeros(n, dtype=np.float64)
+        wl = np.zeros(n, dtype=np.float64)
+        wl2 = np.zeros(n, dtype=np.float64)
+        xl2 = np.zeros(n, dtype=np.float64)
+
+        QLPiter = 0
+        qlp_active = False
+        qlp_reason = None
+        n_null_detected = 0
+
+        # Tridiagonal + Temple bound state (our additions).
+        tridiag_diag = []
+        tridiag_offdiag = []
+        lam_min_bound = float("inf")
+        theta_1 = float("nan")
+        rho_1 = float("nan")
+
+        if maxiter is None:
+            maxiter = n * 4
+
+        # M-orthogonal reorthogonalization buffers.
+        _q_capacity = min(maxiter, 128)
+        lanczos_R = np.empty((_q_capacity, n), dtype=np.float64)
+        lanczos_Z = np.empty((_q_capacity, n), dtype=np.float64)
+        lanczos_rz = np.empty(_q_capacity, dtype=np.float64)
+        lanczos_R[0] = r2
+        lanczos_Z[0] = r3
+        lanczos_rz[0] = beta1_sq
+        nq = 1
+
+        # flag: 0 = still running; on exit we translate to our info.
+        flag = 0
+        info = 0
+        k = 0
+
+        for _ in range(maxiter):
+            k += 1
+            # -------- Preconditioned Lanczos step ------------------
+            betal = beta
+            beta = betan
+            v = r3 / beta
+            r3 = op.matvec(v)
+            if k > 1:
+                r3 = r3 - r1 * (beta / betal)
+            alfa = float(np.dot(r3, v))
+            r3 = r3 - r2 * (alfa / beta)
+            r1 = r2
+            r2 = r3
+            r3 = apply_M(r2)
+
+            # M-orthogonal reorthogonalization (two passes).
+            Rq = lanczos_R[:nq]
+            Zq = lanczos_Z[:nq]
+            inv_rz = 1.0 / lanczos_rz[:nq]
+            for _pass in range(2):
+                coeffs = (Zq @ r2) * inv_rz
+                r2 = r2 - coeffs @ Rq
+                r3 = r3 - coeffs @ Zq
+
+            betan_sq = float(np.dot(r2, r3))
+            noise_tol = _eps * float(lanczos_rz[:nq].max()) if nq > 0 else _eps
+            if betan_sq < -noise_tol:
+                logger.warning(
+                    "%s: preconditioner not positive definite at iter %d "
+                    "(beta^2 = %.3e); stopping",
+                    label,
+                    k,
+                    betan_sq,
+                )
+                info = -1
+                break
+            if betan_sq <= noise_tol:
+                logger.debug(
+                    "%s: Lanczos reached precision limit at iter %d "
+                    "(beta^2 = %.3e <= %.3e); stopping",
+                    label,
+                    k,
+                    betan_sq,
+                    noise_tol,
+                )
+                break
+            betan = float(np.sqrt(betan_sq))
+
+            # Store reorth pair, growing buffers if needed.
+            if nq >= lanczos_R.shape[0]:
+                new_cap = lanczos_R.shape[0] * 2
+                new_R = np.empty((new_cap, n), dtype=np.float64)
+                new_Z = np.empty((new_cap, n), dtype=np.float64)
+                new_R[:nq] = lanczos_R[:nq]
+                new_Z[:nq] = lanczos_Z[:nq]
+                lanczos_R = new_R
+                lanczos_Z = new_Z
+                new_rz = np.empty(new_cap, dtype=np.float64)
+                new_rz[:nq] = lanczos_rz[:nq]
+                lanczos_rz = new_rz
+            lanczos_R[nq] = r2
+            lanczos_Z[nq] = r3
+            lanczos_rz[nq] = betan_sq
+            nq += 1
+
+            tridiag_diag.append(alfa)
+            if k >= 2:
+                tridiag_offdiag.append(beta)
+
+            pnorm = float(np.sqrt(betal * betal + alfa * alfa + betan * betan))
+
+            # -------- Previous left rotation Q_{k-1} ----------------
+            dbar = dltan
+            dlta = cs * dbar + sn * alfa
+            epln = eplnn
+            gbar = sn * dbar - cs * alfa
+            eplnn = sn * betan
+            dltan = -cs * betan
+            dlta_QLP = dlta  # save for MINRES w update
+
+            # -------- Current left rotation Q_k ---------------------
+            gamal3 = gamal2
+            gamal2 = gamal
+            gamal = gama
+            cs, sn, gama = SymGivens(gbar, betan)
+            gama_tmp = gama
+            taul2 = taul
+            taul = tau
+            tau = cs * phi
+            phi = sn * phi
+
+            # -------- Previous right rotation P_{k-2,k} -------------
+            if k > 2:
+                veplnl2 = veplnl
+                etal2 = etal
+                etal = eta
+                dlta_tmp = sr2 * vepln - cr2 * dlta
+                veplnl = cr2 * vepln + sr2 * dlta
+                dlta = dlta_tmp
+                eta = sr2 * gama
+                gama = -cr2 * gama
+
+            # -------- Current right rotation P_{k-1,k} --------------
+            if k > 1:
+                cr1, sr1, gamal = SymGivens(gamal, dlta)
+                vepln = sr1 * gama
+                gama = -cr1 * gama
+
+            # -------- u recurrence + xnorm update --------------------
+            xnorml = xnorm
+            ul4 = ul3
+            ul3 = ul2
+            if k > 2:
+                ul2 = (taul2 - etal2 * ul4 - veplnl2 * ul3) / gamal2
+            if k > 1:
+                ul = (taul - etal * ul3 - veplnl * ul2) / gamal
+            xnorm_tmp = float(np.sqrt(xl2norm * xl2norm + ul2 * ul2 + ul * ul))
+            if abs(gama) > _tiny and xnorm_tmp < maxxnorm:
+                u = (tau - eta * ul2 - vepln * ul) / gama
+                if np.sqrt(xnorm_tmp * xnorm_tmp + u * u) > maxxnorm:
+                    u = 0.0
+                    flag = 6  # xnorm exceeded
+            else:
+                u = 0.0
+                flag = 9  # singular
+            xl2norm = float(np.sqrt(xl2norm * xl2norm + ul2 * ul2))
+            xnorm = float(np.sqrt(xl2norm * xl2norm + ul * ul + u * u))
+
+            # -------- Update w and x --------------------------------
+            use_minres = Acond < acond_max and flag == 0 and QLPiter == 0
+            if use_minres:
+                # MINRES phase
+                wl2 = wl
+                wl = w
+                w = (v - epln * wl2 - dlta_QLP * wl) / gama_tmp
+                if xnorm < maxxnorm:
+                    x = x + tau * w
+                else:
+                    flag = 6
+            else:
+                # MINRES-QLP phase
+                if not qlp_active:
+                    qlp_active = True
+                    if qlp_reason is None:
+                        qlp_reason = "floor"
+                    logger.debug(
+                        "%s: iter %d  MINRES->QLP transition "
+                        "(Acond=%.3e >= acond_max=%.3e)",
+                        label,
+                        k,
+                        Acond,
+                        acond_max,
+                    )
+                QLPiter += 1
+                if QLPiter == 1:
+                    xl2 = np.zeros(n, dtype=np.float64)
+                    if k > 1:
+                        if k > 3:
+                            wl2 = gamal3 * wl2 + veplnl2 * wl + etal * w
+                        if k > 2:
+                            wl = gamal_QLP * wl + vepln_QLP * w
+                        w = gama_QLP * w
+                        xl2 = x - wl * ul_QLP - w * u_QLP
+                if k == 1:
+                    wl2 = wl
+                    wl = v * sr1
+                    w = -v * cr1
+                elif k == 2:
+                    wl2 = wl
+                    wl = w * cr1 + v * sr1
+                    w = w * sr1 - v * cr1
+                else:
+                    wl2 = wl
+                    wl = w
+                    w = wl2 * sr2 - v * cr2
+                    wl2 = wl2 * cr2 + v * sr2
+                    v_tmp = wl * cr1 + w * sr1
+                    w = wl * sr1 - w * cr1
+                    wl = v_tmp
+                xl2 = xl2 + wl2 * ul2
+                x = xl2 + wl * ul + w * u
+
+            # -------- Next right rotation P_{k-1,k+1} --------------
+            gamal_tmp = gamal
+            cr2, sr2, gamal = SymGivens(gamal, eplnn)
+            # Save for a future MINRES->QLP transition.
+            gamal_QLP = gamal_tmp
+            vepln_QLP = vepln
+            gama_QLP = gama
+            ul_QLP = ul
+            u_QLP = u
+
+            # -------- Norm estimates --------------------------------
+            abs_gama = abs(gama)
+            Anorm = max(Anorm, pnorm, abs(gamal), abs_gama)
+            if k == 1:
+                gmin = abs_gama
+                gminl = gmin
+            else:
+                gminl2 = gminl
+                gminl = gmin
+                gmin = min(gminl2, abs(gamal), abs_gama)
+            Acond = Anorm / gmin if gmin > 0.0 else float("inf")
+
+            rnorml = rnorm
+            if flag != 9:
+                rnorm = abs(phi)
+
+            denom = Anorm * xnorm + bnorm
+            test1 = rnorm / denom if denom > 0.0 else float("inf")
+            rootl = float(np.sqrt(gbar * gbar + dltan * dltan))
+            Arnorml = rnorml * rootl
+            test2 = rootl / Anorm if Anorm > 0.0 else float("inf")
+
+            # -------- Temple / Kato-Temple bound (our addition) -----
+            # Filter Ritz values using the same adaptive criterion the
+            # reference QLP solution update uses for its own deflation:
+            # |gama_i| > |tau_i|/maxxnorm admits direction i, so the
+            # Ritz-space analog is
+            #     theta_i > |rho_i| / maxxnorm
+            # where rho_i = |betan * y_i[-1]| is the current residual
+            # projection onto the i-th Ritz direction. A Ritz pair is
+            # flagged null iff its corresponding QLP step would exceed
+            # the xnorm cap. The user-specified ``null_threshold``
+            # (when set) acts as an additional absolute floor raise.
+            if k >= min_iter and len(tridiag_offdiag) > 0:
+                diag_arr = np.asarray(tridiag_diag)
+                offdiag_arr = np.asarray(tridiag_offdiag)
+                try:
+                    eigvals, eigvecs = _sla.eigh_tridiagonal(
+                        diag_arr, offdiag_arr, eigvals_only=False
+                    )
+                    rho_per = np.abs(betan * eigvecs[-1, :])
+                    effective_null_per = rho_per / maxxnorm
+                    if null_threshold is not None:
+                        effective_null_per = np.maximum(
+                            effective_null_per, null_threshold
+                        )
+                    keep = np.where(eigvals >= effective_null_per)[0]
+                    n_null_detected = int(len(eigvals) - len(keep))
+                    if len(keep) >= 1:
+                        i1 = int(keep[0])
+                        theta_1 = float(eigvals[i1])
+                        theta_2 = (
+                            float(eigvals[int(keep[1])])
+                            if len(keep) >= 2
+                            else float("inf")
+                        )
+                        y1_last = float(eigvecs[-1, i1])
+                    else:
+                        theta_1 = float("inf")
+                        theta_2 = float("inf")
+                        y1_last = 1.0
+                except Exception:
+                    theta_1 = float(diag_arr.min())
+                    theta_2 = float("inf")
+                    y1_last = 1.0
+
+                rho_1 = abs(betan * y1_last)
+                if np.isfinite(theta_1) and theta_1 > rho_1:
+                    rho_sq = rho_1 * rho_1
+                    temple_corr = rho_sq / theta_1
+                    gap = theta_2 - theta_1
+                    kt_corr = rho_sq / gap if gap > 0.0 else float("inf")
+                    corr = min(temple_corr, kt_corr)
+                    lam_min_bound = theta_1 - corr
+                else:
+                    lam_min_bound = float("inf")
+
+                if (
+                    not qlp_active
+                    and null_threshold is not None
+                    and n_null_detected > 0
+                ):
+                    # User-threshold-driven null detection — advance
+                    # the qlp_reason tag; the actual phase switch
+                    # happens when the reference Acond criterion fires.
+                    qlp_reason = "null"
+
+            lam_min_effective = lam_min_bound
+            if lam_min_floor is not None and lam_min_floor > 0.0:
+                lam_min_effective = max(lam_min_effective, float(lam_min_floor))
+            edm_bound = (
+                0.5 * rnorm * rnorm / lam_min_effective
+                if np.isfinite(lam_min_effective) and lam_min_effective > 0.0
+                else float("inf")
+            )
+
+            logger.debug(
+                "%s: iter %4d %s  ||r||=%.3e  test1=%.3e  test2=%.3e  "
+                "||x||=%.3e  theta_1=%.3e  rho=%.3e  lam_min>=%.3e  "
+                "edm<=%.3e  Anorm=%.3e  Acond~%.3e  qlp=%s(%s)  nnull=%d",
+                label,
+                k,
+                "QLP" if QLPiter > 0 else "MR ",
+                rnorm,
+                test1,
+                test2,
+                xnorm,
+                theta_1,
+                rho_1,
+                lam_min_effective,
+                edm_bound,
+                Anorm,
+                Acond,
+                "Y" if qlp_active else "N",
+                qlp_reason if qlp_reason is not None else "-",
+                n_null_detected,
+            )
+
+            if callback is not None:
+                callback(x, k, rnorm, lam_min_effective, edm_bound)
+
+            # -------- Stopping tests (reference order) --------------
+            epsx = Anorm * xnorm * _eps
+            if flag == 0 or flag == 9:
+                t1 = 1.0 + test1
+                t2 = 1.0 + test2
+                if k >= maxiter:
+                    flag = 8
+                if Acond >= acond_stop:
+                    flag = 7
+                if xnorm >= maxxnorm:
+                    flag = 6
+                if epsx >= beta1:
+                    flag = 5
+                if t2 <= 1.0:
+                    flag = 4
+                if t1 <= 1.0:
+                    flag = 3
+                if test2 <= rtol:
+                    flag = 2
+                if test1 <= rtol:
+                    flag = 1
+
+            # Our added criteria: edm and atol.
+            if edmtol is not None and edm_bound < edmtol:
+                logger.debug(
+                    "%s: edm bound %.3e < edmtol %.3e, stopping",
+                    label,
+                    edm_bound,
+                    edmtol,
+                )
+                break
+            if atol > 0.0 and rnorm <= atol:
+                logger.debug(
+                    "%s: ||r||=%.3e <= atol %.3e, stopping",
+                    label,
+                    rnorm,
+                    atol,
+                )
+                break
+
+            if flag != 0 and flag != 9:
+                if flag == 7:
+                    logger.warning(
+                        "%s: Acond=%.3e >= acond_stop=%.3e at iter %d "
+                        "— numerically rank-deficient; returning current "
+                        "iterate (||r||=%.3e, ||x||=%.3e)",
+                        label,
+                        Acond,
+                        acond_stop,
+                        k,
+                        rnorm,
+                        xnorm,
+                    )
+                    info = -2
+                elif flag == 6:
+                    logger.warning(
+                        "%s: xnorm=%.3e >= maxxnorm=%.3e at iter %d "
+                        "— solution-norm cap reached; returning current "
+                        "iterate (||r||=%.3e)",
+                        label,
+                        xnorm,
+                        maxxnorm,
+                        k,
+                        rnorm,
+                    )
+                    info = -3
+                elif flag == 8:
+                    info = k  # maxiter
+                else:
+                    info = 0  # converged
+                break
+        else:
+            info = k
+
+        lam_min_final = lam_min_bound
+        if lam_min_floor is not None and lam_min_floor > 0.0:
+            lam_min_final = max(lam_min_final, float(lam_min_floor))
+
+        if qlp_active:
+            logger.info(
+                "%s: QLP phase active (reason=%s, QLPiter=%d, "
+                "n_null_detected=%d, null_threshold=%s, final Acond~%.3e)",
+                label,
+                qlp_reason if qlp_reason is not None else "-",
+                QLPiter,
+                n_null_detected,
+                f"{null_threshold:.3e}" if null_threshold is not None else "None",
+                Acond,
+            )
+
+        return x, info, lam_min_final, rnorm, k
 
     def edmval_cov_rows_hessfree(self, grad, row_indices, rtol=1e-8, maxiter=None):
         """Hessian-free edmval + selected rows of the covariance matrix.
@@ -2927,6 +3991,21 @@ class Fitter:
             self.external_term, self.x, self.indata.dtype
         )
 
+    def _compute_tikhonov_nll(self):
+        """Optional ``0.5 * beta * ||x_sub||^2`` term matching the
+        external preconditioner's Tikhonov shift. Enabled by
+        ``--tikhonovLikelihood``. Returns ``None`` when disabled or when
+        there is no external term. ``beta`` is a tf.Variable populated
+        by :meth:`_ensure_external_precond_factor`, so the value picked
+        up by the tf.function is whatever the factorization settled on.
+        """
+        if not self.tikhonov_likelihood:
+            return None
+        if self.external_term is None:
+            return None
+        x_sub = tf.gather(self.x, self.external_term["indices"])
+        return 0.5 * self.tikhonov_beta * tf.reduce_sum(x_sub * x_sub)
+
     def _compute_nll(self, profile=True, full_nll=False):
         ln, lc, lbeta, lpenalty, beta = self._compute_nll_components(
             profile=profile, full_nll=full_nll
@@ -2942,6 +4021,11 @@ class Fitter:
         lext = self._compute_external_nll()
         if lext is not None:
             l = l + lext
+
+        ltik = self._compute_tikhonov_nll()
+        if ltik is not None:
+            l = l + ltik
+
         return l
 
     def _compute_loss(self, profile=True):
@@ -2983,6 +4067,24 @@ class Fitter:
             hessp = t2.gradient(grad, self.x, output_gradients=p)
             return val, grad, hessp
 
+        def _loss_val_grad_hessp_block(self, P):
+            """Block HVP: for ``P`` of shape ``[n, B]`` return ``H @ P``
+            of the same shape via a single outer-tape ``jacobian`` call
+            with pfor vectorization over the batch dimension. This is
+            typically faster than ``B`` sequential revrev HVPs because
+            the inner loss/grad trace is executed once.
+            """
+            P = tf.stop_gradient(P)
+            with tf.GradientTape() as t2:
+                with tf.GradientTape() as t1:
+                    val = self._compute_loss()
+                grad = t1.gradient(val, self.x)
+                # s[b] = grad^T P[:, b]; Jacobian of s w.r.t. x is H @ P
+                # transposed.
+                s = tf.linalg.matvec(P, grad, transpose_a=True)
+            hp_t = t2.jacobian(s, self.x, experimental_use_pfor=True)
+            return val, grad, tf.transpose(hp_t)
+
         self.loss_val = tf.function(jit_compile=jit)(
             _loss_val.__get__(self, type(self))
         )
@@ -2998,6 +4100,15 @@ class Fitter:
         )
         self.loss_val_grad_hessp_revrev = tf.function(jit_compile=jit)(
             _loss_val_grad_hessp_revrev.__get__(self, type(self))
+        )
+        # Block HVP: jit-compiled with the same flag as the other
+        # loss/grad/HVP wrappers. pfor vectorization in tape.jacobian
+        # produces standard batched TF ops, which XLA handles fine; the
+        # only reasons to disable JIT are the structural ones already
+        # captured in ``jit`` (sparse CSR matmul in templates or in an
+        # external Hessian).
+        self.loss_val_grad_hessp_block = tf.function(jit_compile=jit)(
+            _loss_val_grad_hessp_block.__get__(self, type(self))
         )
         # tf.autodiff.ForwardAccumulator does not support tangent
         # propagation through SparseMatrixMatMul (no JVP rule for the
@@ -3187,27 +4298,99 @@ class Fitter:
                 precond_apply = self._make_external_precond_apply()
                 use_precond = precond_apply is not None or self.diag_precondition
                 if precond_apply is not None:
-                    logger.info("Using external Cholesky preconditioner for CG solve")
-                dx_np, info, lam_min_bound, n_cg_iter = self._cg_solve(
-                    op,
-                    -grad_np,
-                    rtol=0.0,
-                    label="CG solve",
-                    edmtol=self.edmtol,
-                    precondition=use_precond,
-                    precond_apply=precond_apply,
-                )
-                if info != 0:
-                    raise ValueError(
-                        f"CG solver did not converge (info={info}); the "
-                        "Hessian may not be positive-definite or the "
-                        "problem may be ill-conditioned"
+                    logger.info("Using external Cholesky preconditioner for solve")
+                if self.use_minres:
+                    # Custom Choi-Paige-Saunders MINRES-QLP with inline
+                    # Lanczos tridiagonal + Temple/Kato-Temple lower
+                    # bound on lam_min(M^-1 A). The QLP factorization
+                    # gives better numerical stability than plain MINRES
+                    # on near-singular systems; tolerates singular /
+                    # indefinite H, returns minimum-norm (or least-
+                    # squares) solution, and exposes the same edmtol-
+                    # based stopping as the CG solver. The QLP phase is
+                    # entered automatically on a numerical-floor
+                    # conditioning test (Anorm/gamma_min > 1/sqrt(eps));
+                    # an optional explicit null_threshold on theta_1
+                    # (smallest Ritz value of M^-1 A) can trigger the
+                    # switch earlier if the user knows a floor on the
+                    # physically-resolvable eigenvalue scale.
+                    logger.info(
+                        "Using MINRES-QLP for is_linear solve "
+                        "(rtol=%.3e, edmtol=%.3e, null_threshold=%s)",
+                        self.minres_rtol,
+                        self.edmtol,
+                        (
+                            f"{self.minres_null_threshold:.3e}"
+                            if self.minres_null_threshold is not None
+                            else "None"
+                        ),
                     )
-                logger.info(
-                    "Hessian-free CG: %d iterations, lam_min >= %.6e",
-                    n_cg_iter,
-                    lam_min_bound,
-                )
+                    t0 = time.time()
+                    dx_np, info, lam_min_bound, rnorm, n_iter = self._minres_qlp_solve(
+                        op,
+                        -grad_np,
+                        rtol=float(self.minres_rtol),
+                        label="MINRES-QLP",
+                        precondition=use_precond,
+                        precond_apply=precond_apply,
+                        edmtol=self.edmtol,
+                        null_threshold=self.minres_null_threshold,
+                        acond_max=self.minres_acond_max,
+                        **(
+                            {"maxxnorm": float(self.minres_maxxnorm)}
+                            if self.minres_maxxnorm is not None
+                            else {}
+                        ),
+                    )
+                    if info > 0:
+                        logger.warning(
+                            "MINRES-QLP did not converge in %d iterations "
+                            "(rtol=%.3e, edmtol=%.3e); using the returned "
+                            "approximate solution (||r||=%.3e, "
+                            "lam_min>=%.3e)",
+                            n_iter,
+                            self.minres_rtol,
+                            self.edmtol,
+                            rnorm,
+                            lam_min_bound,
+                        )
+                    elif info < 0:
+                        logger.warning(
+                            "MINRES-QLP broke down at iter %d "
+                            "(info=%d); using the returned approximate "
+                            "solution",
+                            n_iter,
+                            info,
+                        )
+                    logger.info(
+                        "Hessian-free MINRES-QLP: %d iterations in %.1fs, "
+                        "lam_min >= %.6e, ||r|| = %.3e",
+                        n_iter,
+                        time.time() - t0,
+                        lam_min_bound,
+                        rnorm,
+                    )
+                else:
+                    dx_np, info, lam_min_bound, n_cg_iter = self._cg_solve(
+                        op,
+                        -grad_np,
+                        rtol=0.0,
+                        label="CG solve",
+                        edmtol=self.edmtol,
+                        precondition=use_precond,
+                        precond_apply=precond_apply,
+                    )
+                    if info != 0:
+                        raise ValueError(
+                            f"CG solver did not converge (info={info}); the "
+                            "Hessian may not be positive-definite or the "
+                            "problem may be ill-conditioned"
+                        )
+                    logger.info(
+                        "Hessian-free CG: %d iterations, lam_min >= %.6e",
+                        n_cg_iter,
+                        lam_min_bound,
+                    )
                 self.x.assign_add(tf.constant(dx_np, dtype=self.x.dtype))
 
             callback = None

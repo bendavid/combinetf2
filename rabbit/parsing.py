@@ -267,6 +267,85 @@ def common_parser():
         "sparse external Hessians.",
     )
     parser.add_argument(
+        "--tikhonovLikelihood",
+        default=False,
+        action="store_true",
+        help="When --externalPrecondition is set, add the same Tikhonov "
+        "shift (0.5 * beta * ||x_sub||^2, where x_sub is the external "
+        "subspace and beta is the value used to make the external "
+        "Cholesky factor PD) to the likelihood itself. With this flag "
+        "the preconditioner matches the regularized likelihood's "
+        "Hessian exactly, so the Newton-step solve is exact rather "
+        "than approximate. Without it (default), Tikhonov appears "
+        "only in the preconditioner and the likelihood is un-"
+        "regularized; the preconditioner is then an approximation, "
+        "biased toward the regularized system.",
+    )
+    parser.add_argument(
+        "--useMinres",
+        default=False,
+        action="store_true",
+        help="Use the custom MINRES-QLP solver instead of CG for the "
+        "is_linear --noHessian solve. MINRES-QLP tolerates singular "
+        "and indefinite Hessians (returns minimum-norm / least-squares "
+        "solution) and its QLP factorization gives better numerical "
+        "behavior than plain MINRES on near-singular systems. Uses "
+        "||r||/||b|| < rtol stopping combined with the same edmtol-"
+        "based stop as CG. Skips the edmval / cov-row computations "
+        "afterwards.",
+    )
+    parser.add_argument(
+        "--minresRtol",
+        default=0.0,
+        type=float,
+        help="rtol for --useMinres (Choi-Paige-Saunders backward-error / "
+        "normal-equation test semantics, as in scipy.minres). Default 0 "
+        "disables this stop and lets --edmtol drive convergence, which "
+        "is usually what you want for the Newton-step solve (on ill-"
+        "conditioned preconditioned systems the backward-error test can "
+        "fire with the absolute residual still large).",
+    )
+    parser.add_argument(
+        "--minresNullThreshold",
+        default=None,
+        type=float,
+        help="Threshold on the smallest Ritz value of the preconditioned "
+        "tridiagonal (i.e. on eigenvalues of M^-1 A): when the smallest "
+        "Ritz value drops below this, MINRES-QLP enters its QLP phase, "
+        "whose 5-term update naturally damps near-null directions. "
+        "Unset by default — the solver still automatically switches to "
+        "QLP on numerical floor via the running Acond estimate, so "
+        "setting this is only needed if you want to trigger QLP mode "
+        "earlier on physically small (but numerically resolvable) "
+        "eigenvalues of the preconditioned system.",
+    )
+    parser.add_argument(
+        "--minresAcondMax",
+        default=None,
+        type=float,
+        help="Condition-number threshold above which MINRES-QLP "
+        "transitions from the MINRES phase to the MINRES-QLP phase "
+        "(matches the reference implementation's TranCond parameter). "
+        "Switch fires when Anorm_est / gamma_min > acond_max. Default "
+        "(unset) uses 1/sqrt(eps) ~ 6.7e7; the Choi-Paige-Saunders "
+        "reference uses 1e7. Lower values switch to QLP earlier (more "
+        "robust on ill-conditioned systems, slightly more expensive "
+        "per iteration); higher values delay the switch.",
+    )
+    parser.add_argument(
+        "--minresMaxxnorm",
+        default=None,
+        type=float,
+        help="Cap on the MINRES-QLP solution norm ||x|| (matches the "
+        "reference implementation's maxxnorm parameter; default 1e7). "
+        "When the next iterate would exceed this cap, the step is "
+        "deflated and the iteration terminates (flag=6). Raising it "
+        "lets the solver run longer on solutions with legitimately "
+        "large norm, but degrades the noise floor (~maxxnorm*eps) and "
+        "increases the chance of accumulated null-space roundoff "
+        "dominating the solution on rank-deficient systems.",
+    )
+    parser.add_argument(
         "--covRelTol",
         default=1e-3,
         type=float,
