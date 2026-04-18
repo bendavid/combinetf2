@@ -478,21 +478,34 @@ def fit(args, fitter, ws, dofit=True):
         # Hessian-vector products. The CG solves touch O(npar) memory
         # per call instead of O(npar^2), so this works on problems
         # where the full covariance would be infeasible.
-        _, grad = fitter.loss_val_grad()
-        npoi = int(fitter.poi_model.npoi)
-        noi_idx_in_x = np.asarray(fitter.indata.noiidxs, dtype=np.int64) + npoi
-        poi_noi_idx = np.concatenate([np.arange(npoi, dtype=np.int64), noi_idx_in_x])
-        edmval, cov_rows = fitter.edmval_cov_rows_hessfree(grad, poi_noi_idx)
-        logger.info(f"edmval: {edmval}")
-
-        # Build a full-length variance vector with the POI+NOI entries
-        # populated from the diagonal of the CG-solved rows and the rest
-        # left as NaN (we did not compute those). add_parms_hist stores
-        # the vector verbatim into the workspace.
+        #
+        # Skipped entirely under --useMinres: the CG-based edmval /
+        # cov-row machinery relies on Lanczos lam_min bounds that
+        # MINRES doesn't expose, and MINRES is also used precisely when
+        # the Hessian may be singular (so the cov-row solve would be
+        # ill-defined anyway).
         n = int(fitter.x.shape[0])
-        parms_variances_np = np.full(n, np.nan, dtype=np.float64)
-        for k, i in enumerate(poi_noi_idx):
-            parms_variances_np[int(i)] = cov_rows[k, int(i)]
+        if getattr(args, "useMinres", False):
+            logger.info("Skipping edmval/cov-row computation under --useMinres")
+            edmval = np.nan
+            parms_variances_np = np.full(n, np.nan, dtype=np.float64)
+        else:
+            _, grad = fitter.loss_val_grad()
+            npoi = int(fitter.poi_model.npoi)
+            noi_idx_in_x = np.asarray(fitter.indata.noiidxs, dtype=np.int64) + npoi
+            poi_noi_idx = np.concatenate(
+                [np.arange(npoi, dtype=np.int64), noi_idx_in_x]
+            )
+            edmval, cov_rows = fitter.edmval_cov_rows_hessfree(grad, poi_noi_idx)
+            logger.info(f"edmval: {edmval}")
+
+            # Build a full-length variance vector with the POI+NOI entries
+            # populated from the diagonal of the CG-solved rows and the rest
+            # left as NaN (we did not compute those). add_parms_hist stores
+            # the vector verbatim into the workspace.
+            parms_variances_np = np.full(n, np.nan, dtype=np.float64)
+            for k, i in enumerate(poi_noi_idx):
+                parms_variances_np[int(i)] = cov_rows[k, int(i)]
         parms_variances = tf.constant(parms_variances_np, dtype=fitter.indata.dtype)
 
     nllvalreduced = fitter.reduced_nll().numpy()
