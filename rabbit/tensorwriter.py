@@ -626,7 +626,10 @@ class TensorWriter:
                 yield linear_idx, self._make_empty_sparsehist(keep_axes, keep_size)
             return
 
-        multi = np.unravel_index(flat_idx, h.shape)
+        # SparseHist internal flat indices are in the with-flow layout; use
+        # the per-axis extents (h.axes.extent, matching hist) — h.shape is
+        # the no-flow shape and would unravel to the wrong coordinates.
+        multi = np.unravel_index(flat_idx, h.axes.extent)
 
         # Drop entries that fall in flow bins of any extra axis (we only
         # iterate over the regular bins of those axes, matching the existing
@@ -918,7 +921,10 @@ class TensorWriter:
         delta_vals = np.asarray(h._values, dtype=np.float64)
 
         if len(flat_idx) > 0:
-            multi = np.unravel_index(flat_idx, h.shape)
+            # SparseHist internal flat indices are in the with-flow layout;
+            # use h.axes.extent (matching hist) — h.shape is the no-flow
+            # shape and would unravel to the wrong coordinates.
+            multi = np.unravel_index(flat_idx, h.axes.extent)
             # free flat_idx — we only need the per-axis multi-dim arrays now
             flat_idx = None
 
