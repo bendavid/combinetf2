@@ -285,8 +285,19 @@ class Fitter:
             # the dominant nominal-template noise via norm^A/norm^B; the
             # systematic-template noise is de-biased in the curvature).
             if int(logk_folds.shape[0]) == 2:
-                self.logk_A = self.logk_folds_scaled[0]
-                self.logk_B = self.logk_folds_scaled[1]
+                # For ADDITIVE ('normal') systematics the half prediction's
+                # variation is absolute and must be rescaled by the SAME
+                # k/(k/2)=2 factor as the rescaled nominal norm_A/norm_B (the
+                # variation scales with the yield). For 'log_normal' the
+                # multiplicative ratio exp(logk*theta) is scale-invariant under
+                # the x2 norm rescale, so no factor is applied there.
+                half_scale = (
+                    tf.constant(2.0, dtype=self.indata.dtype)
+                    if self.indata.systematic_type == "normal"
+                    else tf.constant(1.0, dtype=self.indata.dtype)
+                )
+                self.logk_A = half_scale * self.logk_folds_scaled[0]
+                self.logk_B = half_scale * self.logk_folds_scaled[1]
             else:
                 logger.info(
                     "split-logk with k>2: the objective uses shared logk (the "
@@ -1131,6 +1142,15 @@ class Fitter:
             g = t1.gradient(ln, self.x)
         H_ln = t2.jacobian(g, self.x)
 
+        # Poisson expected-information weight D = 1/nexp must be the SHARED
+        # full-sample prediction for EVERY term of the debiased U-statistic
+        # bread; using each fold term's own raw n_i (~nexp_full/k) breaks the
+        # full-minus-self identity F_sumfold - sum_i F_i = sum_{i!=j} cross
+        # (with per-term D it leaves a -sum_i F_i self-term, driving the bread
+        # indefinite -> Cholesky fails). fisher_terms[0] is the full / sum-of-
+        # folds prediction; for every non-fold path there is a single term with
+        # n == nexp_full, so nref reproduces the previous 1/n exactly.
+        nref = fisher_terms[0][0]
         F = tf.zeros_like(hess_obj)
         for n, c in fisher_terms:
             J = t1.jacobian(n, self.x)  # [nbins, nparams]
@@ -1138,7 +1158,7 @@ class Fitter:
                 JT_Cinv = tf.matmul(J, self.data_cov_inv, transpose_a=True)
                 Fterm = tf.matmul(JT_Cinv, J)
             else:
-                D = (1.0 / self.varnobs) if self.chisqFit else (1.0 / n)
+                D = (1.0 / self.varnobs) if self.chisqFit else (1.0 / nref)
                 Fterm = tf.einsum("bi,b,bj->ij", J, D, J)
             F = F + c * Fterm
         del t1, t2
