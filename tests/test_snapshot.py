@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 import h5py
 import numpy as np
@@ -147,29 +148,106 @@ def test_mismatched_lengths_are_rejected():
 def test_sigterm_writes_a_snapshot_before_the_process_dies():
     """SIGTERM is how a scheduler announces a wall clock limit.
 
-    Run in a subprocess: the handler re-raises the signal, so the process is
-    meant to actually die, and the test is that the file is on disk afterwards.
+    The main thread is deliberately blocked inside a long numpy matmul, not a
+    sleep. That is the case this mechanism exists for and the one an earlier
+    sleep-based version of this test failed to cover: a sleep is interruptible,
+    so Python dispatches the handler immediately and the test passes whether or
+    not the design works. A matmul holds the interpreter down in C for its
+    whole duration -- exactly like the TensorFlow calls a real fit spends
+    minutes inside -- and the snapshot has to be written anyway.
+
+    The assertion is therefore on *latency*: the process must die promptly
+    after the signal, not when the matmul happens to finish.
     """
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "s.hdf5")
-        # rabbit.snapshot deliberately does not import the fitter, so this
-        # subprocess starts without TensorFlow and the test runs in seconds
+        # np.sort, not a matmul: sorting is single-threaded and its cost is
+        # predictable, whereas BLAS picks thread counts by matrix size, so a
+        # small calibration matmul does not extrapolate (a run sized for 25 s
+        # finished in 0.58 s on a many-core box). Both hold the interpreter in
+        # C for the whole call, which is the property under test.
         script = f"""
-import os, signal, time, numpy as np
+import os, signal, threading, time
+import numpy as np
 from rabbit.snapshot import Snapshotter, snapshot_on_signal
+
+rng = np.random.default_rng(0)
+big = rng.random(300_000_000)          # ~2.4 GB, sorts in tens of seconds
+
 s = Snapshotter({path!r}, np.array(["a", "b"]))
 s.update(np.array([1.5, -2.5]))
-with snapshot_on_signal(s):
+
+def fire():
+    time.sleep(2.0)
     os.kill(os.getpid(), signal.SIGTERM)
-    time.sleep(30)
+
+threading.Thread(target=fire, daemon=True).start()
+with snapshot_on_signal(s):
+    start = time.perf_counter()
+    big.sort()      # main thread is now in C, holding no Python bytecode
+    print("BLOCKING_CALL_FINISHED", time.perf_counter() - start, flush=True)
+    time.sleep(60)
 """
+        t0 = time.perf_counter()
         proc = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, timeout=60
+            [sys.executable, "-c", script], capture_output=True, timeout=300
         )
-        assert proc.returncode == -signal.SIGTERM, (
-            f"expected death by SIGTERM, got {proc.returncode}: "
-            f"{proc.stderr.decode()[-500:]}"
+        elapsed = time.perf_counter() - t0
+
+        assert proc.returncode == 128 + int(signal.SIGTERM), (
+            f"expected exit 128+SIGTERM, got {proc.returncode}: "
+            f"{proc.stderr.decode()[-600:]}"
         )
         with h5py.File(path, "r") as h:
             assert np.allclose(h["x"][...], [1.5, -2.5])
             assert h.attrs["reason"] == "signal-SIGTERM"
+        # the sort runs for tens of seconds; dying inside 15 s means the
+        # snapshot happened while the main thread was still in C, which is the
+        # whole point. The guard above catches the case where it did not.
+        assert b"BLOCKING_CALL_FINISHED" not in proc.stdout, (
+            "the blocking call finished before the signal was handled; this "
+            "run did not exercise a blocked main thread, so it proves nothing"
+        )
+        assert elapsed < 15.0, f"snapshot-on-signal took {elapsed:.1f}s"
+
+
+def test_sigint_also_snapshots():
+    """Ctrl-C, with the main thread responsive -- the easy case still works."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "s.hdf5")
+        script = f"""
+import os, signal, time
+import numpy as np
+from rabbit.snapshot import Snapshotter, snapshot_on_signal
+s = Snapshotter({path!r}, np.array(["a"]))
+s.update(np.array([9.0]))
+with snapshot_on_signal(s):
+    os.kill(os.getpid(), signal.SIGINT)
+    time.sleep(30)
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, timeout=120
+        )
+        assert proc.returncode == 128 + int(signal.SIGINT), proc.stderr.decode()[-400:]
+        with h5py.File(path, "r") as h:
+            assert np.allclose(h["x"][...], [9.0])
+            assert h.attrs["reason"] == "signal-SIGINT"
+
+
+def test_handlers_and_wakeup_fd_are_restored_on_exit():
+    """The context manager must leave the process as it found it, or a second
+    fit in the same process inherits a dangling pipe."""
+    import rabbit.snapshot as mod
+
+    before_term = signal.getsignal(signal.SIGTERM)
+    before_int = signal.getsignal(signal.SIGINT)
+    with tempfile.TemporaryDirectory() as tmp:
+        s = Snapshotter(os.path.join(tmp, "s.hdf5"), np.array(["a"]))
+        with mod.snapshot_on_signal(s):
+            assert signal.getsignal(signal.SIGTERM) is not before_term
+        assert signal.getsignal(signal.SIGTERM) is before_term
+        assert signal.getsignal(signal.SIGINT) is before_int
+        # a wakeup fd left behind would make Python write signal bytes into a
+        # closed descriptor for the rest of the process's life
+        current = signal.set_wakeup_fd(-1)
+        assert current == -1, f"wakeup fd left set to {current}"

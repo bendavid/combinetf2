@@ -39,6 +39,7 @@ from a plain subprocess, where pulling in TensorFlow costs minutes.
 import contextlib
 import os
 import signal
+import threading
 
 import h5py
 import numpy as np
@@ -164,37 +165,102 @@ def snapshot_on_signal(snapshotter):
     ``kill`` reaches a fit someone has decided to stop; SIGINT is Ctrl-C.
     Both otherwise destroy every parameter value the fit has found.
 
-    The snapshot is written from inside the handler rather than by asking
-    the minimiser to stop at the next iteration. On a large model a single
-    iteration can run for hours, and a scheduler that has sent SIGTERM will
-    follow it with SIGKILL long before then -- so a cooperative stop would
-    arrive too late to be the safety net this is for.
+    Doing the write in the Python signal handler does not work here, which was
+    learned the expensive way: a preempted 22-hour fit wrote 33 periodic
+    snapshots and zero signal ones. Python runs signal handlers only in the
+    main thread, between bytecodes, and this fit spends its time inside single
+    TensorFlow calls that run for minutes -- one iteration took 910 s. SIGTERM
+    arrived, the interpreter never regained control to dispatch it, and SIGKILL
+    followed. A cooperative "stop at the next iteration" fails for the same
+    reason, only worse.
 
-    The previous handler is then restored and the signal re-raised, so the
-    process still dies the way the sender intended and with the right exit
-    status. Nothing about the fit's own control flow changes.
+    So the C-level handler writes the signal number to a pipe (that is all
+    ``set_wakeup_fd`` does, and it happens immediately and without the GIL),
+    and a daemon thread blocked on the read end does the snapshot. TensorFlow
+    releases the GIL for the duration of a long op, so that thread runs while
+    the main thread is still down in C++. The Python-level handler installed
+    alongside is deliberately a no-op: its only job is to make the signal
+    "handled" so that set_wakeup_fd reports it.
+
+    The thread then exits the process itself with 128+signum, the encoding a
+    shell reports for a signal death. It cannot re-raise the signal properly:
+    that needs signal.signal() to restore the default disposition, and Python
+    only allows that from the main thread -- the very thread that is stuck.
     """
     if snapshotter.filename is None:
         yield
         return
 
+    read_fd, write_fd = os.pipe()
+    # set_wakeup_fd requires a non-blocking write end -- it must never stall
+    # inside the C handler; the reader blocks, which is what we want.
+    os.set_blocking(write_fd, False)
+    os.set_blocking(read_fd, True)
+
     previous = {}
+    stopping = threading.Event()
 
-    def handle(signum, frame):
-        snapshotter.save_latest(f"signal-{signal.Signals(signum).name}")
-        signal.signal(signum, previous.get(signum, signal.SIG_DFL))
-        os.kill(os.getpid(), signum)
+    def _worker():
+        while True:
+            try:
+                data = os.read(read_fd, 1)
+            except OSError:
+                return
+            if not data or stopping.is_set():
+                return  # the sentinel written on clean exit
+            signum = data[0]
+            snapshotter.save_latest(f"signal-{signal.Signals(signum).name}")
+            # Terminate from here rather than re-raising. Restoring SIG_DFL
+            # first would be the tidy way, but signal.signal() only works on
+            # the main thread -- and the main thread is the one stuck in C,
+            # which is why this thread exists at all. os._exit is immediate and
+            # skips interpreter shutdown, which matters: the snapshot is
+            # already on disk and a scheduler that sent SIGTERM is counting
+            # down to SIGKILL. 128+signum is the conventional encoding a shell
+            # reports for a signal death.
+            os._exit(128 + signum)
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            previous[sig] = signal.signal(sig, handle)
-        except ValueError:
-            # signal handlers can only be installed from the main thread;
-            # off the main thread the periodic and failure snapshots still
-            # work, so carry on rather than refusing to fit
-            logger.debug(f"Could not install a {sig!r} snapshot handler")
+    thread = None
+    prev_wakeup = None
+
+    def _noop(signum, frame):
+        """Never does the work; see the class docstring. Present only so the
+        signal counts as handled and set_wakeup_fd fires for it."""
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, _noop)
+        prev_wakeup = signal.set_wakeup_fd(write_fd)
+    except ValueError:
+        # only the main thread may install handlers or a wakeup fd; off it the
+        # periodic and failure snapshots still work, so carry on rather than
+        # refusing to fit
+        logger.debug("Could not arm signal snapshots (not the main thread)")
+        for sig, prev in previous.items():
+            signal.signal(sig, prev)
+        previous.clear()
+    else:
+        thread = threading.Thread(
+            target=_worker, name="snapshot-on-signal", daemon=True
+        )
+        thread.start()
+
     try:
         yield
     finally:
+        stopping.set()
+        if prev_wakeup is not None:
+            signal.set_wakeup_fd(prev_wakeup)
         for sig, prev in previous.items():
             signal.signal(sig, prev)
+        if thread is not None:
+            try:
+                os.write(write_fd, b"\x00")  # wake the reader so it can exit
+            except OSError:
+                pass
+            thread.join(timeout=5.0)
+        for fd in (write_fd, read_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
