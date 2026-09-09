@@ -105,9 +105,7 @@ class Fitter:
         self.precondition_params = getattr(options, "preconditionParams", None)
         self.precondition_from = getattr(options, "preconditionFrom", "hessian")
         self.precondition_blocks = getattr(options, "preconditionBlocks", "auto")
-        self.precondition_transform = getattr(
-            options, "preconditionTransform", "ridge"
-        )
+        self.precondition_transform = getattr(options, "preconditionTransform", "ridge")
         self.precondition_block_threshold = getattr(
             options, "preconditionBlockThreshold", 0.1
         )
