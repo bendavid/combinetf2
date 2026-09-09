@@ -157,7 +157,14 @@ class Preconditioner:
 
     @classmethod
     def from_hessian(
-        cls, hess, theta_ref, index_blocks, ridge=1e-8, max_tries=4, names=None
+        cls,
+        hess,
+        theta_ref,
+        index_blocks,
+        ridge=1e-8,
+        max_tries=4,
+        names=None,
+        transform="ridge",
     ):
         """Build from a reference Hessian, one factorisation per index block.
 
@@ -182,6 +189,7 @@ class Preconditioner:
                 max_tries,
                 label,
                 names=names,
+                transform=transform,
             )
             if blk is not None:
                 blocks.append(blk)
@@ -225,7 +233,111 @@ class Preconditioner:
         return cls(theta_ref, blocks)
 
     @staticmethod
-    def _factorise(hess, idx, ridge, max_tries, label="", names=None):
+    def _factorise(
+        hess, idx, ridge, max_tries, label="", names=None, transform="ridge"
+    ):
+        """Dispatch to the requested transform. See --preconditionTransform."""
+        if transform == "spectral":
+            return Preconditioner._factorise_spectral(
+                hess, idx, ridge, max_tries, label=label, names=names
+            )
+        if transform == "ridge":
+            return Preconditioner._factorise_ridge(
+                hess, idx, ridge, max_tries, label=label, names=names
+            )
+        raise ValueError(f"unknown preconditioner transform {transform!r}")
+
+    @staticmethod
+    def _factorise_ridge(hess, idx, ridge, max_tries, label="", names=None):
+        """Ridge path: factorise ``H + eps*I``, escalating eps until it succeeds.
+
+        rabbit's original transform, kept as the default. A single scalar ridge
+        cannot serve a block whose curvatures span orders of magnitude -- see
+        :meth:`_factorise_spectral` and the note on --preconditionTransform --
+        so prefer spectral for heterogeneous blocks.
+        """
+        tag = f"{label} " if label else ""
+        if idx.size == 0:
+            logger.warning(f"Preconditioning block {tag}is empty; skipping.")
+            return None
+
+        block = np.asarray(hess, dtype=np.float64)[np.ix_(idx, idx)]
+        # symmetrise: the autodiff Hessian is symmetric only up to roundoff
+        block = 0.5 * (block + block.T)
+
+        diag = np.diag(block)
+        scale = float(np.max(diag)) if diag.size else 0.0
+        if not np.isfinite(scale) or scale <= 0.0:
+            logger.warning(
+                f"Preconditioning block {tag}has no positive diagonal "
+                f"(max diag = {scale}); skipping.  [{_describe(idx, names)}]"
+            )
+            return None
+
+        cond_before = _cond_corr(block)
+        # Ridge schedule: try the caller's value first, since for a positive
+        # definite block that is all that is needed and the Cholesky is cheap.
+        # Only if that fails is the spectrum worth the extra O(m^3): the ridge
+        # required to restore definiteness is set by the most negative
+        # eigenvalue, so it can be computed rather than guessed. Escalating by
+        # powers of a hundred instead used to overshoot badly -- blocks needing
+        # 0.03 were skipped after 1e-4 failed and 1e-2 was tried next.
+        schedule = [ridge]
+        for itry in range(max_tries):
+            if itry >= len(schedule):
+                if itry == 1:
+                    w = np.linalg.eigvalsh(block)
+                    lam_min, lam_max = float(w[0]), float(w[-1])
+                    if lam_min < 0.0:
+                        # enough to make it positive definite, plus a margin so
+                        # the smallest eigenvalue is not left at zero
+                        need = abs(lam_min) + max(
+                            0.1 * abs(lam_min), 1e-8 * abs(lam_max)
+                        )
+                        schedule.append(need / scale)
+                        logger.debug(
+                            f"{tag}block has lam_min={lam_min:.3g} "
+                            f"(max|diag|={scale:.3g}); ridge from the spectrum: "
+                            f"{schedule[-1]:.3g} x max|diag|"
+                        )
+                    else:
+                        schedule.append(max(schedule[-1], 1e-12) * 100.0)
+                else:
+                    schedule.append(max(schedule[-1], 1e-12) * 100.0)
+            eps = schedule[itry]
+            trial = block.copy()
+            if eps > 0.0:
+                trial[np.diag_indices_from(trial)] += eps * scale
+            try:
+                chol = scipy.linalg.cholesky(trial, lower=True)
+            except scipy.linalg.LinAlgError:
+                logger.debug(
+                    f"Preconditioner Cholesky failed for {tag}block "
+                    f"with ridge {eps:.3g} x max|diag| (try {itry + 1})"
+                )
+                continue
+            # Conditioning actually achieved: L^-1 B L^-T for the *un-ridged*
+            # block B. Using the ridged matrix here would return 1 by
+            # construction and measure nothing.
+            tb = scipy.linalg.solve_triangular(chol, block, lower=True, trans="N")
+            tb = scipy.linalg.solve_triangular(chol, tb.T, lower=True, trans="N").T
+            cond_after = _cond_corr(tb)
+            logger.debug(
+                f"Preconditioning {tag}block of {idx.size} parameters from the "
+                f"reference Hessian (ridge {eps:.3g} x max|diag|): correlation "
+                f"condition number {cond_before:.3g} -> {cond_after:.3g} at the "
+                "reference point"
+            )
+            return Block(idx, chol, cond_before, cond_after, label)
+
+        logger.warning(
+            f"Preconditioning block {tag}is not factorisable; the largest ridge "
+            f"tried was {max(schedule):.3g} x max|diag|. Skipping this block."
+        )
+        return None
+
+    @staticmethod
+    def _factorise_spectral(hess, idx, ridge, max_tries, label="", names=None):
         """One block -> a :class:`Block`, or None if it is unusable."""
         tag = f"{label} " if label else ""
         if idx.size == 0:
@@ -302,8 +414,9 @@ class Preconditioner:
         # and the block comes out at condition number 33 instead of 1
         # (tests/test_preconditioner_spectral.py pins exactly this).
         #
-        # `ridge` is therefore unused on this path; it is kept in the signature
-        # so the CLI and callers are unchanged.
+        # `ridge` and `max_tries` are unused on THIS path (they belong to the
+        # ridge transform); the signature is shared so the dispatcher can call
+        # either without special-casing.
         floor = float(np.finfo(np.float64).eps) * float(idx.size) * wmax
         n_floored = int(np.count_nonzero(aw < floor))
         aw = np.maximum(aw, floor if floor > 0 else np.finfo(float).tiny)

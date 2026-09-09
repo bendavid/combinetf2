@@ -34,9 +34,9 @@ HARD = np.array(
 )
 
 
-def _factorise(block, ridge=1e-8):
+def _factorise(block, ridge=1e-8, transform="spectral"):
     return precond.Preconditioner._factorise(
-        block, np.arange(block.shape[0]), ridge, 4, ""
+        block, np.arange(block.shape[0]), ridge, 4, "", transform=transform
     )
 
 
@@ -96,3 +96,20 @@ def test_near_null_direction_is_floored_not_amplified():
     assert blk is not None
     # the floor keeps L^-1 bounded; without it 1/sqrt(1e-18) = 1e9
     assert np.max(np.abs(blk.chol)) < 1e3
+
+
+def test_default_transform_is_ridge_so_existing_behaviour_is_unchanged():
+    """The spectral transform is opt-in. Shipping it as the default would change
+    the numerics of every --precondition user on a feature that is not ours."""
+    import inspect
+
+    sig = inspect.signature(precond.Preconditioner._factorise)
+    assert sig.parameters["transform"].default == "ridge"
+
+    # and the ridge path still reproduces the failure mode it is known for,
+    # which is the reason spectral exists -- if this ever passes, the ridge
+    # implementation changed underneath us
+    blk = _factorise(HARD, transform="ridge")
+    assert blk is not None
+    t = _whiten(blk.chol, HARD)
+    assert _cond_true(t) > 1e7

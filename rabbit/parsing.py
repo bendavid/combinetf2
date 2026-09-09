@@ -257,7 +257,7 @@ def common_parser():
         "'expressions' makes one block per --preconditionParams entry. 'none' does "
         "no grouping at all and factorises the whole selected scope as a single "
         "block, which keeps every cross-correlation but is the most expensive and "
-        "fails entirely if any part of the scope is singular.",
+        "fails entirely if any part of the scope is singular. NOTE the purpose of blocking depends on the transform. Under 'ridge' it is a correctness tool: one scalar ridge cannot serve a block whose curvatures span orders of magnitude, so splitting protects the soft directions. Under 'spectral' a larger block is always better or equal -- it whitens the cross-terms exactly where splitting discards them (measured: one block of 8 gives condition number 1, the same matrix in two blocks gives 4.0) -- so blocking there only limits the O(m^3) cost, and 'none' is usually the right choice.",
     )
     parser.add_argument(
         "--preconditionBlockThreshold",
@@ -266,7 +266,7 @@ def common_parser():
         help="Correlation threshold for --preconditionBlocks auto. Correlations "
         "below it are left unpreconditioned. Too low and every parameter "
         "percolates into a single block; too high and genuinely coupled "
-        "parameters are split apart.",
+        "parameters are split apart. Only used by --preconditionBlocks auto. Under 'spectral' this threshold works against you: it splits away exactly the cross-correlations the spectral transform would have handled exactly, so 'every parameter percolates into a single block' is the IDEAL there rather than the warning it is under 'ridge'.",
     )
     parser.add_argument(
         "--preconditionFrom",
@@ -281,7 +281,7 @@ def common_parser():
         "exact Hessian is indefinite at the starting point, whitening with it leaves "
         "those directions negative and the fit stalls, so 'hessian' is usually the "
         "better choice; prefer 'gaussnewton' only where the Hessian is positive "
-        "definite anyway, e.g. near a minimum.",
+        "definite anyway, e.g. near a minimum. Under --preconditionTransform spectral there is no reason to choose gaussnewton: its PSD-ness exists to guarantee the Cholesky succeeds, which spectral does not need, and it still cannot represent negative curvature. Prefer 'hessian' there.",
     )
     parser.add_argument(
         "--preconditionRidge",
@@ -290,7 +290,28 @@ def common_parser():
         help="Ridge added to the preconditioning block diagonal, relative to its largest "
         "diagonal entry, to keep near-degenerate blocks factorisable. Escalated "
         "automatically if the Cholesky still fails; a block that cannot be factorised "
-        "falls back to no preconditioning.",
+        "falls back to no preconditioning. ONLY applies to --preconditionTransform ridge; the spectral transform derives its floor from the numerical rank instead.",
+    )
+    parser.add_argument(
+        "--preconditionTransform",
+        default="ridge",
+        type=str,
+        choices=["ridge", "spectral"],
+        help="How to whiten each block. 'ridge' (the default) factorises "
+        "H + eps*I, raising eps until the Cholesky succeeds. 'spectral' "
+        "factorises |H| = Q |Lambda| Q^T instead, giving every eigendirection "
+        "its own scale. They agree exactly on a positive definite block -- both "
+        "return the identity -- and differ where H is indefinite, which on real "
+        "data it generally is away from the minimum. A single scalar ridge must "
+        "be at least |lam_min| to restore definiteness, so in a block whose "
+        "curvatures span orders of magnitude it swamps every softer direction "
+        "and the whitening leaves them near-null: measured on curvatures "
+        "(3.3e9, -8.7e6, 1) the O(1) direction landed at 7e-08 and the block "
+        "went from condition number 3.3e+09 to 1.44e+08, where spectral gives "
+        "1. Spectral also handles a block whose whole diagonal is negative, "
+        "which the ridge cannot start on at all. It costs an eigendecomposition "
+        "rather than a Cholesky: measured 11x at m=200 and 44x at m=2112, i.e. "
+        "~1.7 s once per preconditioner build.",
     )
     parser.add_argument(
         "--snapshotFile",

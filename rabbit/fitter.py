@@ -105,6 +105,9 @@ class Fitter:
         self.precondition_params = getattr(options, "preconditionParams", None)
         self.precondition_from = getattr(options, "preconditionFrom", "hessian")
         self.precondition_blocks = getattr(options, "preconditionBlocks", "auto")
+        self.precondition_transform = getattr(
+            options, "preconditionTransform", "ridge"
+        )
         self.precondition_block_threshold = getattr(
             options, "preconditionBlockThreshold", 0.1
         )
@@ -2347,6 +2350,7 @@ class Fitter:
             theta_ref,
             index_blocks,
             ridge=self.precondition_ridge,
+            transform=self.precondition_transform,
             # names so the per-block log says WHICH parameters each block holds;
             # "block of 14 parameters" alone leaves no way to tell from a log
             # which directions the transform actually helped.
