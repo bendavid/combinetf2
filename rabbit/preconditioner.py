@@ -162,10 +162,11 @@ class Preconditioner:
         """Build from a reference Hessian, one factorisation per index block.
 
         ``index_blocks`` is a list of index arrays (a single array is accepted
-        and treated as one block). Each block is symmetrised, then a ridge
-        proportional to its largest diagonal entry is added until the Cholesky
-        succeeds. A block that cannot be factorised is dropped -- the others
-        still apply, and a preconditioner must never break a fit.
+        and treated as one block). Each block is symmetrised and then whitened
+        by the Cholesky of ``|H| = Q |Lambda| Q^T`` -- see :meth:`_factorise`
+        for why the absolute value of the spectrum rather than a ridge. A block
+        that cannot be factorised is dropped: the others still apply, and a
+        preconditioner must never break a fit.
         """
         if isinstance(index_blocks, np.ndarray) or (
             index_blocks and np.isscalar(index_blocks[0])
@@ -236,80 +237,102 @@ class Preconditioner:
         block = 0.5 * (block + block.T)
 
         diag = np.diag(block)
-        scale = float(np.max(diag)) if diag.size else 0.0
-        if not np.isfinite(scale) or scale <= 0.0:
+        if diag.size == 0 or not np.all(np.isfinite(block)):
             logger.warning(
-                f"Preconditioning block {tag}has no positive diagonal "
-                f"(max diag = {scale}); skipping.  [{_describe(idx, names)}]"
+                f"Preconditioning block {tag}is empty or non-finite; skipping."
+                f"  [{_describe(idx, names)}]"
             )
             return None
 
         cond_before = _cond_corr(block)
-        # Ridge schedule: try the caller's value first, since for a positive
-        # definite block that is all that is needed and the Cholesky is cheap.
-        # Only if that fails is the spectrum worth the extra O(m^3): the ridge
-        # required to restore definiteness is set by the most negative
-        # eigenvalue, so it can be computed rather than guessed. Escalating by
-        # powers of a hundred instead used to overshoot badly -- blocks needing
-        # 0.03 were skipped after 1e-4 failed and 1e-2 was tried next.
-        schedule = [ridge]
-        for itry in range(max_tries):
-            if itry >= len(schedule):
-                if itry == 1:
-                    w = np.linalg.eigvalsh(block)
-                    lam_min, lam_max = float(w[0]), float(w[-1])
-                    if lam_min < 0.0:
-                        # enough to make it positive definite, plus a margin so
-                        # the smallest eigenvalue is not left at zero
-                        need = abs(lam_min) + max(
-                            0.1 * abs(lam_min), 1e-8 * abs(lam_max)
-                        )
-                        schedule.append(need / scale)
-                        logger.debug(
-                            f"{tag}block has lam_min={lam_min:.3g} "
-                            f"(max|diag|={scale:.3g}); ridge from the spectrum: "
-                            f"{schedule[-1]:.3g} x max|diag|"
-                        )
-                    else:
-                        schedule.append(max(schedule[-1], 1e-12) * 100.0)
-                else:
-                    schedule.append(max(schedule[-1], 1e-12) * 100.0)
-            eps = schedule[itry]
-            trial = block.copy()
-            if eps > 0.0:
-                trial[np.diag_indices_from(trial)] += eps * scale
-            try:
-                chol = scipy.linalg.cholesky(trial, lower=True)
-            except scipy.linalg.LinAlgError:
-                logger.debug(
-                    f"Preconditioner Cholesky failed for {tag}block "
-                    f"with ridge {eps:.3g} x max|diag| (try {itry + 1})"
-                )
-                continue
-            # Conditioning actually achieved: L^-1 B L^-T for the *un-ridged*
-            # block B. Using the ridged matrix here would return 1 by
-            # construction and measure nothing.
-            tb = scipy.linalg.solve_triangular(chol, block, lower=True, trans="N")
-            tb = scipy.linalg.solve_triangular(chol, tb.T, lower=True, trans="N").T
-            cond_after = _cond_corr(tb)
-            # Log the MEMBERS, not just the size: "block of 14 parameters" does
-            # not say which 14, so there is no way to tell from a log which
-            # parameters the transform actually helped. Names come from the
-            # optional `names` argument; without it this degrades to indices.
-            who = _describe(idx, names)
-            logger.debug(
-                f"Preconditioning {tag}block of {idx.size} parameters from the "
-                f"reference Hessian (ridge {eps:.3g} x max|diag|): correlation "
-                f"condition number {cond_before:.3g} -> {cond_after:.3g} at the "
-                f"reference point  [{who}]"
-            )
-            return Block(idx, chol, cond_before, cond_after, label)
 
-        logger.warning(
-            f"Preconditioning block {tag}is not factorisable; the largest ridge "
-            f"tried was {max(schedule):.3g} x max|diag|. Skipping this block."
+        # SPECTRAL whitening: factorise |H| = Q |Lambda| Q^T rather than
+        # ridging H into definiteness.
+        #
+        # Why not a ridge. A ridge is ONE number and it has to be at least
+        # |lam_min| to restore definiteness, so in a block whose curvatures span
+        # orders of magnitude it swamps every direction softer than itself.
+        # Those directions come back out of the whitening as near-null: measured
+        # on a real 3-parameter case with curvatures (3.3e9, -8.7e6, 1), the
+        # O(1) direction landed at 7e-08 and the block's true condition number
+        # went 3.3e+09 -> 1.44e+08, where the spectral transform gives 1. That
+        # is not a corner case -- it is what happens whenever a constrained
+        # nuisance shares a block with an unconstrained parameter, and it made
+        # the difference between a 3720-parameter fit stalling and converging.
+        #
+        # Taking |Lambda| keeps the SIGN of each direction in the new
+        # coordinates (the true Hessian maps to diag(+1, -1, +1) above), which
+        # matters because trust-krylov exploits negative curvature to escape
+        # saddles; flattening it to +1 would throw that away, and is why the
+        # Gauss-Newton reference matrix does badly here (see
+        # Fitter._reference_matrix).
+        #
+        # For a positive-definite block this is IDENTICAL in result to the
+        # plain Cholesky -- both give exactly the identity -- so nothing is lost
+        # on the easy blocks; it only costs more (measured 11x at m=200, 44x at
+        # m=2112, i.e. 1.7 s once per build, against a fit of tens of minutes).
+        try:
+            w, Q = np.linalg.eigh(block)
+        except np.linalg.LinAlgError as ex:
+            logger.warning(
+                f"Preconditioning block {tag}eigendecomposition failed ({ex}); "
+                f"skipping.  [{_describe(idx, names)}]"
+            )
+            return None
+
+        aw = np.abs(w)
+        wmax = float(np.max(aw))
+        if not np.isfinite(wmax) or wmax <= 0.0:
+            logger.warning(
+                f"Preconditioning block {tag}has an all-zero spectrum; "
+                f"skipping.  [{_describe(idx, names)}]"
+            )
+            return None
+        # Floor the numerically-null directions. A direction indistinguishable
+        # from zero curvature has no scale to whiten to, and 1/sqrt(~0) would
+        # hand the minimizer an enormous spurious step.
+        #
+        # The threshold is the standard numerical-RANK cutoff, eps * m * wmax
+        # (what pinv and lstsq use), NOT the `ridge` parameter. That distinction
+        # is the whole point: whether a direction is resolvable is a question
+        # about floating point, not about physics. Reusing `ridge` here was
+        # tried and is wrong -- at its 1e-8 default and wmax = 3.3e9 the floor
+        # lands at 33, which is ABOVE a genuine curvature of 1.0 in the very
+        # block this transform exists for, so a physical direction gets flattened
+        # and the block comes out at condition number 33 instead of 1
+        # (tests/test_preconditioner_spectral.py pins exactly this).
+        #
+        # `ridge` is therefore unused on this path; it is kept in the signature
+        # so the CLI and callers are unchanged.
+        floor = float(np.finfo(np.float64).eps) * float(idx.size) * wmax
+        n_floored = int(np.count_nonzero(aw < floor))
+        aw = np.maximum(aw, floor if floor > 0 else np.finfo(float).tiny)
+
+        absH = (Q * aw) @ Q.T
+        absH = 0.5 * (absH + absH.T)
+        try:
+            chol = scipy.linalg.cholesky(absH, lower=True)
+        except scipy.linalg.LinAlgError as ex:
+            logger.warning(
+                f"Preconditioning block {tag}Cholesky of |H| failed ({ex}); "
+                f"skipping.  [{_describe(idx, names)}]"
+            )
+            return None
+
+        # Conditioning actually achieved, on the UN-modified block: using |H|
+        # here would return 1 by construction and measure nothing.
+        tb = scipy.linalg.solve_triangular(chol, block, lower=True, trans="N")
+        tb = scipy.linalg.solve_triangular(chol, tb.T, lower=True, trans="N").T
+        cond_after = _cond_corr(tb)
+        n_neg = int(np.count_nonzero(w < 0.0))
+        logger.debug(
+            f"Preconditioning {tag}block of {idx.size} parameters by spectral "
+            f"whitening of |H| (lam in [{w[0]:.3g}, {w[-1]:.3g}], {n_neg} "
+            f"negative, {n_floored} floored): correlation condition number "
+            f"{cond_before:.3g} -> {cond_after:.3g} at the reference point"
+            f"  [{_describe(idx, names)}]"
         )
-        return None
+        return Block(idx, chol, cond_before, cond_after, label)
 
     # -- the transform ---------------------------------------------------
 
