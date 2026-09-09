@@ -156,7 +156,9 @@ class Preconditioner:
         return max(c) if c else None
 
     @classmethod
-    def from_hessian(cls, hess, theta_ref, index_blocks, ridge=1e-8, max_tries=4):
+    def from_hessian(
+        cls, hess, theta_ref, index_blocks, ridge=1e-8, max_tries=4, names=None
+    ):
         """Build from a reference Hessian, one factorisation per index block.
 
         ``index_blocks`` is a list of index arrays (a single array is accepted
@@ -173,7 +175,12 @@ class Preconditioner:
         for spec in index_blocks:
             label, idx = ("", spec) if not isinstance(spec, tuple) else spec
             blk = cls._factorise(
-                hess, np.asarray(idx, dtype=np.int64), ridge, max_tries, label
+                hess,
+                np.asarray(idx, dtype=np.int64),
+                ridge,
+                max_tries,
+                label,
+                names=names,
             )
             if blk is not None:
                 blocks.append(blk)
@@ -189,19 +196,35 @@ class Preconditioner:
         n_req = len(index_blocks)
         npar = sum(b.idx.size for b in blocks)
         conds = [b.cond_before for b in blocks if b.cond_before is not None]
+        # Report the conditioning ACHIEVED, not a hardcoded 1. The literal "-> 1"
+        # this used to print claimed the transform had whitened every block
+        # perfectly, which is only true of the ridged matrix; measured on the
+        # un-ridged block (Block.cond_after) it can be worse than where it
+        # started -- seen at 1.8e+03 -> 1e+04 on a block whose ridge was forced
+        # up to |lam_min| by a large negative eigenvalue. A summary that cannot
+        # express that is worse than none, because it is read as success.
+        conds_after = [b.cond_after for b in blocks if b.cond_after is not None]
         summary = f"Preconditioned {len(blocks)} of {n_req} block(s), {npar} parameters"
         if conds:
             summary += (
                 f"; correlation condition number median {np.median(conds):.3g}, "
-                f"worst {max(conds):.3g} -> 1 at the reference point"
+                f"worst {max(conds):.3g}"
             )
+            if conds_after:
+                summary += (
+                    f" -> median {np.median(conds_after):.3g}, "
+                    f"worst {max(conds_after):.3g}"
+                )
+                if max(conds_after) > max(conds):
+                    summary += " (WORSE than unpreconditioned)"
+            summary += " at the reference point"
         if len(blocks) < n_req:
             summary += f" ({n_req - len(blocks)} block(s) not factorisable, skipped)"
         logger.info(summary)
         return cls(theta_ref, blocks)
 
     @staticmethod
-    def _factorise(hess, idx, ridge, max_tries, label=""):
+    def _factorise(hess, idx, ridge, max_tries, label="", names=None):
         """One block -> a :class:`Block`, or None if it is unusable."""
         tag = f"{label} " if label else ""
         if idx.size == 0:
@@ -217,7 +240,7 @@ class Preconditioner:
         if not np.isfinite(scale) or scale <= 0.0:
             logger.warning(
                 f"Preconditioning block {tag}has no positive diagonal "
-                f"(max diag = {scale}); skipping."
+                f"(max diag = {scale}); skipping.  [{_describe(idx, names)}]"
             )
             return None
 
@@ -269,11 +292,16 @@ class Preconditioner:
             tb = scipy.linalg.solve_triangular(chol, block, lower=True, trans="N")
             tb = scipy.linalg.solve_triangular(chol, tb.T, lower=True, trans="N").T
             cond_after = _cond_corr(tb)
+            # Log the MEMBERS, not just the size: "block of 14 parameters" does
+            # not say which 14, so there is no way to tell from a log which
+            # parameters the transform actually helped. Names come from the
+            # optional `names` argument; without it this degrades to indices.
+            who = _describe(idx, names)
             logger.debug(
                 f"Preconditioning {tag}block of {idx.size} parameters from the "
                 f"reference Hessian (ridge {eps:.3g} x max|diag|): correlation "
                 f"condition number {cond_before:.3g} -> {cond_after:.3g} at the "
-                "reference point"
+                f"reference point  [{who}]"
             )
             return Block(idx, chol, cond_before, cond_after, label)
 
@@ -370,6 +398,21 @@ class Preconditioner:
             f"preconditioning: {self.n_blocks} block(s) covering "
             f"{self.nblock} of {self.n} parameters"
         )
+
+
+def _describe(idx, names=None, limit=8):
+    """Readable membership for a block: names when available, else indices."""
+    idx = np.asarray(idx).ravel()
+    if names is None:
+        out = [str(int(i)) for i in idx[:limit]]
+    else:
+        out = [
+            str(names[int(i)]) if int(i) < len(names) else str(int(i))
+            for i in idx[:limit]
+        ]
+    if idx.size > limit:
+        out.append(f"... +{idx.size - limit} more")
+    return ", ".join(out)
 
 
 def _cond_corr(mat):

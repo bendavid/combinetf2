@@ -2347,6 +2347,10 @@ class Fitter:
             theta_ref,
             index_blocks,
             ridge=self.precondition_ridge,
+            # names so the per-block log says WHICH parameters each block holds;
+            # "block of 14 parameters" alone leaves no way to tell from a log
+            # which directions the transform actually helped.
+            names=[str(p) for p in self.parms],
         )
 
     def fit(self):
