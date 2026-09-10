@@ -75,6 +75,7 @@ class Fitter:
         self.indata = indata
 
         self.earlyStopping = options.earlyStopping
+        self.stallRelTol = getattr(options, "stallRelTol", 0.0)
         self.globalImpactsFromJVP = globalImpactsFromJVP
 
         if self.indata.systematic_type not in Fitter.valid_systematic_types:
@@ -2449,7 +2450,12 @@ class Fitter:
 
         with snapshot_on_signal(snapshotter):
             while True:
-                cb = FitterCallback(xval, self.earlyStopping, snapshotter=snapshotter)
+                cb = FitterCallback(
+                    xval,
+                    self.earlyStopping,
+                    snapshotter=snapshotter,
+                    stall_rel_tol=self.stallRelTol,
+                )
                 try:
                     res = scipy.optimize.minimize(
                         scipy_loss,

@@ -23,7 +23,7 @@ logger = logging.child_logger(__name__)
 
 
 class FitterCallback:
-    def __init__(self, xv, early_stopping=-1, snapshotter=None):
+    def __init__(self, xv, early_stopping=-1, snapshotter=None, stall_rel_tol=0.0):
         self.iiter = 0
         self.xval = xv
         # Optional rabbit.snapshot.Snapshotter. The callback is the only place
@@ -38,6 +38,29 @@ class FitterCallback:
         self.t0 = time.time()
 
         self.early_stopping = early_stopping
+        # Relative improvement over the --earlyStopping window below which the
+        # fit counts as stalled. 0.0, the default, is exactly the original test:
+        # `gained <= 0` is `ref - loss <= 0` is `ref <= loss`, so the behaviour
+        # of every existing caller is bit-identical.
+        #
+        # Why make it relative at all. The exact test fires only on LITERALLY no
+        # improvement over the window, so a fit that crawls never satisfies it
+        # and --maxRestarts never gets a chance to rebuild the preconditioner at
+        # the point the fit has actually reached. That is a real gap in the
+        # trigger, but it is NOT a bug we have observed: replayed against our
+        # own trajectories they keep gaining 0.2-4% per 30 iterations, no
+        # threshold up to 1e-3 fires, and the exact test was correctly reporting
+        # "not stalled". Do not read this option as a fix for a known stall.
+        #
+        # And note what it cannot distinguish: "flat to 1e-4 over 20 iterations"
+        # is also what APPROACHING A MINIMUM looks like, whereas the exact test
+        # only fires once the trust radius has genuinely collapsed. So a
+        # non-zero value will tend to fire near a good minimum and spend a full
+        # reference-Hessian evaluation (measured 130-424 s) on each restart.
+        # RESTART_MIN_IMPROVEMENT bounds the loop and scipy's gtol usually exits
+        # first, so it is not unsafe -- but it is a behaviour change, which is
+        # why it is off by default.
+        self.stall_rel_tol = float(stall_rel_tol)
         # set just before raising, so fit() can tell a recoverable stall apart
         # from a genuine error and restart instead of giving up
         self.stopped_early = False
@@ -56,15 +79,23 @@ class FitterCallback:
         if np.isnan(loss):
             raise ValueError(f"Loss value is NaN at iteration {self.iiter}")
 
-        if (
-            self.early_stopping > 0
-            and len(self.loss_history) > self.early_stopping
-            and self.loss_history[-self.early_stopping] <= loss
-        ):
-            self.stopped_early = True
-            raise ValueError(
-                f"No reduction in loss after {self.early_stopping} iterations, early stopping."
-            )
+        if self.early_stopping > 0 and len(self.loss_history) > self.early_stopping:
+            ref = self.loss_history[-self.early_stopping]
+            gained = ref - loss
+            # scale by |ref| so the threshold means the same thing at loss 1e7
+            # and at loss 1e4; ref == 0 falls back to the absolute test
+            budget = self.stall_rel_tol * abs(ref)
+            if gained <= budget:
+                self.stopped_early = True
+                how = (
+                    f"only {gained / abs(ref):.3g} relative"
+                    if ref
+                    else f"only {gained:.3g} absolute"
+                )
+                raise ValueError(
+                    f"Loss improved {how} over {self.early_stopping} iterations "
+                    f"(threshold {self.stall_rel_tol:.3g}), early stopping."
+                )
 
         self.loss_history.append(loss)
         self.time_history.append(elapsed)

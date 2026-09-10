@@ -193,6 +193,22 @@ def common_parser():
         "no progress rather than exiting. Specify -1 to disable.",
     )
     parser.add_argument(
+        "--stallRelTol",
+        default=0.0,
+        type=float,
+        help="Relative loss improvement over the --earlyStopping window below "
+        "which the fit counts as stalled. The default 0.0 is exactly the "
+        "original test, which fires only on literally NO improvement -- so a "
+        "fit that crawls is never detected and, with --maxRestarts, never gets "
+        "its preconditioner rebuilt at the point it has actually reached. "
+        "Something like 1e-4 treats 'improving by a hundredth of a percent per "
+        "hundred iterations' as the stall it is. WARNING: the test cannot tell a "
+        "crawl from convergence -- flat over the window is also what approaching "
+        "a minimum looks like -- so a non-zero value will also fire near a good "
+        "minimum, at one reference-Hessian evaluation per restart. Leave it at 0 "
+        "unless a fit is demonstrably crawling.",
+    )
+    parser.add_argument(
         "--maxRestarts",
         default=-1,
         type=int,
