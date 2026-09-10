@@ -16,10 +16,9 @@ def _cond_true(m):
     return float(sv[0] / sv[-1])
 
 
-def _whiten(chol, block):
-    """L^-1 B L^-T, the true block in the new coordinates."""
-    t = scipy.linalg.solve_triangular(chol, block, lower=True, trans="N")
-    return scipy.linalg.solve_triangular(chol, t.T, lower=True, trans="N").T
+# L^-1 B L^-T, the true block in the new coordinates. The module's own, so
+# these tests measure what the log line reports.
+_whiten = precond._whiten
 
 
 # The case that motivated this: curvatures spanning nine orders of magnitude,
@@ -90,12 +89,53 @@ def test_all_negative_block_is_usable():
 
 
 def test_near_null_direction_is_floored_not_amplified():
-    """A genuinely flat direction has no scale to whiten to."""
+    """A genuinely flat direction has no scale to whiten to.
+
+    The quantity to pin is L^-1, not L. L holds sqrt(|lam|), so a near-null
+    direction makes its entries SMALL -- asserting on them passes whether or
+    not the flooring happens.
+    """
     m = np.diag([1.0, 1e-18]).astype(float)
     blk = _factorise(m, ridge=1e-8)
     assert blk is not None
-    # the floor keeps L^-1 bounded; without it 1/sqrt(1e-18) = 1e9
-    assert np.max(np.abs(blk.chol)) < 1e3
+
+    # what the floor bounds: 1/sqrt(eps*m*wmax) rather than 1/sqrt(1e-18) = 1e9
+    floor = np.finfo(np.float64).eps * 2 * 1.0
+    assert np.max(np.abs(np.linalg.inv(blk.chol))) == pytest.approx(
+        1.0 / np.sqrt(floor), rel=0.1
+    )
+
+    # so the protection is a factor of ~21 here (1e9 -> 4.7e7), not unbounded
+    # -> bounded. Enough that the trust region can reject the step; the comment
+    # in _factorise_spectral says so, and this is the number it refers to.
+    unfloored = scipy.linalg.cholesky(np.diag([1.0, 1e-18]), lower=True)
+    gain = np.max(np.abs(np.linalg.inv(unfloored))) / np.max(
+        np.abs(np.linalg.inv(blk.chol))
+    )
+    assert 10.0 < gain < 100.0
+
+    # and the resolvable direction is untouched
+    assert blk.chol[0, 0] == pytest.approx(1.0)
+
+
+def test_ridge_can_start_on_an_all_negative_block():
+    """The DEFAULT path must not drop a block for having no positive diagonal.
+
+    The ridge is expressed in units of max|diag|; scaling it by max(diag)
+    instead skipped every all-negative block outright (21 of 34 on one real
+    fit). The first Cholesky still fails, then the spectrum branch sizes the
+    ridge from |lam_min| and it succeeds. Not as good as spectral -- 320
+    against 1 on this block -- but a usable transform beats none.
+    """
+    neg = np.diag([-7.5e3, -6.3e4, -2.1e3]).astype(float)
+    blk = _factorise(neg, transform="ridge")
+    assert blk is not None
+    t = _whiten(blk.chol, neg)
+    assert _cond_true(t) < 1e3
+    assert np.all(np.diag(t) < 0)  # signs survive here too
+
+    spectral = _whiten(_factorise(neg, transform="spectral").chol, neg)
+    assert _cond_true(spectral) < _cond_true(t)
 
 
 def test_default_transform_is_ridge_so_existing_behaviour_is_unchanged():
@@ -103,8 +143,17 @@ def test_default_transform_is_ridge_so_existing_behaviour_is_unchanged():
     the numerics of every --precondition user on a feature that is not ours."""
     import inspect
 
+    # all three places the default lives, so flipping one cannot pass silently
     sig = inspect.signature(precond.Preconditioner._factorise)
     assert sig.parameters["transform"].default == "ridge"
+    assert (
+        inspect.signature(precond.Preconditioner.from_hessian)
+        .parameters["transform"]
+        .default
+        == "ridge"
+    )
+    # the --preconditionTransform and Fitter defaults, the other two places it
+    # lives, are pinned in test_preconditioner.py (they need the fitter stack)
 
     # and the ridge path still reproduces the failure mode it is known for,
     # which is the reason spectral exists -- if this ever passes, the ridge

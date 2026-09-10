@@ -2316,7 +2316,16 @@ class Fitter:
         # formed (memory, or a tracing failure on a large model) fall back to an
         # unpreconditioned fit rather than taking the whole job down.
         try:
+            _t_ref = time.time()
             hess_np = self._reference_matrix()
+            # Time it: this is a FULL Hessian at the current point, and it is
+            # the entire cost of a preconditioner rebuild. Whether restarting
+            # aggressively is worth it is exactly this number against the
+            # remaining iterations, so it should not have to be guessed.
+            logger.debug(
+                f"Preconditioner reference matrix ({self.precondition_from}) "
+                f"took {time.time() - _t_ref:.1f} s"
+            )
         except Exception as ex:
             logger.warning(
                 f"Could not compute the reference Hessian for preconditioning ({ex}); "
@@ -2351,8 +2360,10 @@ class Fitter:
             transform=self.precondition_transform,
             # names so the per-block log says WHICH parameters each block holds;
             # "block of 14 parameters" alone leaves no way to tell from a log
-            # which directions the transform actually helped.
-            names=[str(p) for p in self.parms],
+            # which directions the transform actually helped. astype(str), not
+            # str() per element: indata.systs comes out of h5py as an object
+            # array of bytes, so str() would render every name as b'...'.
+            names=self.parms.astype(str),
         )
 
     def fit(self):
