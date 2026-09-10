@@ -229,13 +229,23 @@ def _feed(losses, early_stopping=3, stall_rel_tol=0.0):
     return False, cb
 
 
-# healthy descent, a hard flat, a crawl, and one that gets worse
+# healthy descent, a hard flat, a crawl, one that gets worse, and the inputs
+# where the algebra stops holding: ref == 0.0 (the relative form would divide
+# by zero) and a loss pinned at an infinity (inf - inf and 0.0 * inf are both
+# NaN, and every NaN comparison is False). +inf is REACHABLE -- __call__ raises
+# on a NaN loss but not an infinite one, and a Poisson term with a
+# non-positive prediction and non-zero data gives exactly +inf -- so an
+# equivalence claim that excluded it would be the wrong claim.
 TRAJECTORIES = [
     [10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
     [10.0, 9.0, 9.0, 9.0, 9.0, 9.0],
     [1e4, 1e4 * (1 - 1e-5), 1e4 * (1 - 2e-5), 1e4 * (1 - 3e-5), 1e4 * (1 - 4e-5)],
     [10.0, 9.0, 9.5, 10.0, 10.5, 11.0],
     [0.0, 0.0, 0.0, 0.0, 0.0],
+    [np.inf] * 5,
+    [-np.inf] * 5,
+    [np.inf, np.inf, 5.0, 5.0, 5.0, 5.0],
+    [np.inf, np.inf, np.inf, np.inf, 1.0, 1.0],
 ]
 
 
@@ -292,3 +302,33 @@ def test_stall_rel_tol_defaults_to_zero_everywhere_it_is_set():
         assert not hasattr(options, "stallRelTol")
         f = fitter.Fitter(indata_obj, load_model("Mu", indata_obj), options)
         assert f.stallRelTol == 0.0
+
+
+def test_default_path_keeps_the_original_early_stopping_message():
+    """Every existing user sees this string; the default path must not reword it."""
+    stalled, cb = _feed([10.0, 9.0, 9.0, 9.0, 9.0, 9.0], stall_rel_tol=0.0)
+    assert stalled
+    with pytest.raises(ValueError, match=r"No reduction in loss after 3 iterations"):
+        _raise(cb_losses=[10.0, 9.0, 9.0, 9.0, 9.0, 9.0], stall_rel_tol=0.0)
+
+    # and the relative phrasing only appears when a threshold is in play
+    with pytest.raises(ValueError, match=r"Loss improved only .* relative"):
+        _raise(cb_losses=[1e4 * (1 - 1e-5 * i) for i in range(8)], stall_rel_tol=1e-3)
+
+
+def _raise(cb_losses, stall_rel_tol):
+    cb = FitterCallback(np.zeros(2), early_stopping=3, stall_rel_tol=stall_rel_tol)
+    for i, loss in enumerate(cb_losses):
+        cb(_result(loss, [i, i]))
+
+
+def test_negative_stall_rel_tol_is_rejected():
+    """A negative threshold would require the loss to WORSEN to count as
+    stalled -- it weakens the test, so it is a footgun rather than an option."""
+    with pytest.raises(ValueError, match=r"must be >= 0"):
+        FitterCallback(np.zeros(2), early_stopping=3, stall_rel_tol=-1e-4)
+
+    from rabbit import parsing
+
+    with pytest.raises(SystemExit):
+        parsing.common_parser().parse_args(["d.hdf5", "--stallRelTol", "-1e-4"])

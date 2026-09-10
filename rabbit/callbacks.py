@@ -60,6 +60,15 @@ class FitterCallback:
         # RESTART_MIN_IMPROVEMENT bounds the loop and scipy's gtol usually exits
         # first, so it is not unsafe -- but it is a behaviour change, which is
         # why it is off by default.
+        # Negative would silently WEAKEN the test -- it would require the loss
+        # to get worse before declaring a stall, i.e. a quieter trigger than
+        # the default rather than a louder one.
+        if float(stall_rel_tol) < 0.0:
+            raise ValueError(
+                f"stall_rel_tol must be >= 0, got {stall_rel_tol}. A negative "
+                "threshold would require the loss to WORSEN before the fit "
+                "counts as stalled."
+            )
         self.stall_rel_tol = float(stall_rel_tol)
         # set just before raising, so fit() can tell a recoverable stall apart
         # from a genuine error and restart instead of giving up
@@ -81,12 +90,33 @@ class FitterCallback:
 
         if self.early_stopping > 0 and len(self.loss_history) > self.early_stopping:
             ref = self.loss_history[-self.early_stopping]
-            gained = ref - loss
-            # scale by |ref| so the threshold means the same thing at loss 1e7
-            # and at loss 1e4; ref == 0 falls back to the absolute test
-            budget = self.stall_rel_tol * abs(ref)
-            if gained <= budget:
+            # Scale by |ref| so the threshold means the same thing at loss 1e7
+            # and at loss 1e4; ref == 0 falls back to the absolute test.
+            #
+            # Written as `loss >= ref - budget`, with `budget` short-circuited
+            # at tol == 0, so the default is the ORIGINAL predicate for every
+            # input including the infinities. `ref - loss <= tol * abs(ref)`
+            # is not: with the loss pinned at an infinity both sides are NaN
+            # (inf - inf, and 0.0 * inf), every NaN comparison is False, and
+            # the stall goes undetected where `ref <= loss` sees inf <= inf and
+            # fires. That case is reachable -- __call__ raises on a NaN loss
+            # but not an infinite one, and a Poisson term with a non-positive
+            # prediction and non-zero data gives exactly +inf -- and it is
+            # precisely the collapsed-trust-radius stall --earlyStopping
+            # exists to catch, so missing it means running to
+            # maxiter = 200 * nparams instead.
+            budget = self.stall_rel_tol * abs(ref) if self.stall_rel_tol else 0.0
+            if loss >= ref - budget:
                 self.stopped_early = True
+                if not self.stall_rel_tol:
+                    # unchanged wording on the default path: every existing
+                    # user sees this string, and "improved only 0 relative" is
+                    # an awkward way to say "did not improve"
+                    raise ValueError(
+                        f"No reduction in loss after {self.early_stopping} "
+                        "iterations, early stopping."
+                    )
+                gained = ref - loss
                 how = (
                     f"only {gained / abs(ref):.3g} relative"
                     if ref

@@ -164,6 +164,22 @@ def add_style_args(parser):
     )
 
 
+def _stall_rel_tol(value):
+    """--stallRelTol: a relative improvement, so negative is meaningless.
+
+    A negative threshold would require the loss to WORSEN before the fit counts
+    as stalled, i.e. it weakens the test rather than tightening it, which is
+    the opposite of what anyone reaching for the option wants.
+    """
+    x = float(value)
+    if x < 0.0:
+        raise argparse.ArgumentTypeError(
+            f"must be >= 0, got {x}: a negative threshold would require the "
+            "loss to worsen before the fit counts as stalled"
+        )
+    return x
+
+
 def common_parser():
     """Return a parser with common arguments for fitting scripts (rabbit_fit, rabbit_limit)."""
     parser = argparse.ArgumentParser()
@@ -195,7 +211,7 @@ def common_parser():
     parser.add_argument(
         "--stallRelTol",
         default=0.0,
-        type=float,
+        type=_stall_rel_tol,
         help="Relative loss improvement over the --earlyStopping window below "
         "which the fit counts as stalled. The default 0.0 is exactly the "
         "original test, which fires only on literally NO improvement -- so a "
@@ -206,7 +222,12 @@ def common_parser():
         "crawl from convergence -- flat over the window is also what approaching "
         "a minimum looks like -- so a non-zero value will also fire near a good "
         "minimum, at one reference-Hessian evaluation per restart. Leave it at 0 "
-        "unless a fit is demonstrably crawling.",
+        "unless a fit is demonstrably crawling. For the upper bound: a descent "
+        "at factor f per iteration is declared stalled exactly when "
+        "tol >= 1 - f^N for a window of N = --earlyStopping, so a healthy fit "
+        "converging at 0.1%% per iteration over a window of 20 is flagged by "
+        "anything above 0.0198. Pick the value from your own f and N rather "
+        "than in the abstract.",
     )
     parser.add_argument(
         "--maxRestarts",
