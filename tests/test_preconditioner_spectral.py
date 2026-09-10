@@ -10,10 +10,8 @@ import scipy.linalg
 
 from rabbit import preconditioner as precond
 
-
-def _cond_true(m):
-    sv = np.linalg.svd(np.asarray(m, dtype=np.float64), compute_uv=False)
-    return float(sv[0] / sv[-1])
+# the module's own, so these tests measure exactly what the log reports
+_cond_true = precond._cond_true
 
 
 # L^-1 B L^-T, the true block in the new coordinates. The module's own, so
@@ -42,6 +40,12 @@ def _factorise(block, ridge=1e-8, transform="spectral"):
 def test_spectral_whitens_a_block_a_ridge_cannot():
     blk = _factorise(HARD)
     assert blk is not None
+    # the reported pair is the TRUE condition number at both ends, and the
+    # scale-free degeneracy is carried separately -- on this block the latter
+    # is 1.2, which is exactly why it must not be the "after" number
+    assert blk.cond_before == pytest.approx(_cond_true(HARD), rel=1e-6)
+    assert blk.cond_after == pytest.approx(1.0, rel=1e-6)
+    assert blk.corr_before == pytest.approx(precond._cond_corr(HARD), rel=1e-6)
     t = _whiten(blk.chol, HARD)
     # spectral reaches the identity up to sign
     assert _cond_true(t) == pytest.approx(1.0, rel=1e-6)
@@ -58,6 +62,51 @@ def test_spectral_whitens_a_block_a_ridge_cannot():
     assert _cond_true(tr) > 1e7  # measured 1.44e+08
     # the soft direction collapses to near-null: that is the whole failure
     assert np.min(np.abs(np.diag(tr))) < 1e-6  # measured 7e-08
+
+
+@pytest.mark.parametrize("n", [5, 12, 30, 60])
+def test_spectral_leaves_true_condition_number_exactly_one(n):
+    """The spec of the spectral transform, at any block size.
+
+    B and |B| share eigenvectors, so with |B| = L L^T the congruence
+    L^-1 B L^-T sends Lambda to its own signature: `tb` is symmetric AND
+    orthogonal, hence tb^2 = I and true kappa == 1 identically -- not
+    approximately, and not only on a hand-built 3x3.
+
+    This also pins why the *correlation* number is not reported for the
+    whitened block: L is a Cholesky factor rather than the eigenbasis, so
+    diag(tb) picks up the arbitrary orientation between the two and the
+    1/sqrt|diag| normalisation turns it into an artefact that GROWS with block
+    size, while the truth stays 1.
+    """
+    rng = np.random.default_rng(n)
+    a = rng.standard_normal((n, n))
+    block = a + a.T  # symmetric and indefinite, the case that matters
+
+    # nothing floored, or the congruence identity below does not hold
+    w = np.linalg.eigvalsh(block)
+    floor = np.finfo(np.float64).eps * n * np.max(np.abs(w))
+    assert not np.any(np.abs(w) < floor)
+
+    blk = _factorise(block)
+    tb = _whiten(blk.chol, block)
+
+    assert np.allclose(tb @ tb, np.eye(n), atol=1e-8 * n)
+    assert _cond_true(tb) == pytest.approx(1.0, rel=1e-6)
+    assert blk.cond_after == pytest.approx(1.0, rel=1e-6)
+
+    # and the correlation number would have claimed otherwise, increasingly so
+    if n >= 12:
+        assert precond._cond_corr(tb) > 5.0
+
+
+def test_flooring_is_why_true_kappa_is_measured_not_assumed():
+    """A floored direction is one the congruence no longer preserves."""
+    m = np.diag([1.0, -2.0, 1e-20])
+    blk = _factorise(m)
+    tb = _whiten(blk.chol, m)
+    assert not np.allclose(tb @ tb, np.eye(3), atol=1e-6)
+    assert blk.cond_after > 1e3  # legitimately far from 1
 
 
 def test_identical_to_cholesky_when_positive_definite():

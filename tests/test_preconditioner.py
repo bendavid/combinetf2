@@ -456,7 +456,10 @@ def test_fit_is_invariant_on_an_ill_conditioned_block(method):
 
         # default scope must have found the unconstrained polynomial block
         assert pc.enabled and pc.nblock > 1
-        # and it must actually be badly conditioned before, well conditioned after
+        # and it must actually be badly conditioned before, well conditioned
+        # after. These are TRUE condition numbers at both ends, not the
+        # scale-free degeneracy (pc.blocks[i].corr_before) -- see WHAT THE
+        # NUMBERS MEAN in preconditioner.py.
         assert pc.cond_before > 1e3
         assert pc.cond_after < 1e2
         assert check_results("plain", plain, "preconditioned", pre)

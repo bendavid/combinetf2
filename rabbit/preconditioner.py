@@ -100,6 +100,42 @@ string at a time:
     Applies to 'ridge' only; spectral derives its floor from the numerical
     rank of the block instead.
 
+WHAT THE NUMBERS MEAN. Two different questions get asked about a block, and
+conflating them is how a preconditioner comes to look like it worked:
+
+    condition number   kappa of the block itself (:func:`_cond_true`). This is
+                       what the minimizer feels -- the Krylov inner solve costs
+                       ~sqrt(kappa) Hessian-vector products -- so it is the
+                       number a transform has to reduce, and it is reported at
+                       BOTH ends of the before/after arrow.
+    degeneracy         kappa of the block's CORRELATION matrix
+                       (:func:`_cond_corr`), i.e. after normalising to unit
+                       diagonal. Scale-free, so it isolates genuine
+                       near-linear-dependence from a mismatch of units.
+
+The degeneracy is reported for the block as it ARRIVES only, where the units
+are an arbitrary convention and factoring them out is the right thing to do.
+It is deliberately not reported for the whitened block, for two reasons:
+
+- the units there are not arbitrary -- they are precisely what the transform
+  chose, and flattening them hides the failure mode of a single scalar ridge,
+  which swamps every direction softer than |lam_min| and leaves them near-null
+  (measured: 1.225 -> 1 by correlation, where the truth is 3.3e9 -> 1.4e8);
+- on the spectral path it is not even an approximation, it is an artefact. B
+  and |B| share eigenvectors, so with |B| = L L^T the congruence L^-1 B L^-T
+  sends Lambda to its own signature: tb is symmetric AND orthogonal, tb^2 = I,
+  and true kappa is identically 1 for any block size. But L is a Cholesky
+  factor, not the eigenbasis, so diag(tb) is only bounded by [-1, 1] and the
+  1/sqrt|diag| normalisation picks up the arbitrary orientation between the
+  two. Measured on random indefinite blocks, the correlation number then reads
+  1.7 at m=5, 7.7 at m=12, 21 at m=30, 34 at m=60 -- growing with block size,
+  i.e. worst exactly where --preconditionBlocks none sends you -- while the
+  true value is 1 throughout.
+
+  The identity holds only where nothing was floored: a floored direction is one
+  the congruence no longer preserves, so n_floored > 0 legitimately takes true
+  kappa away from 1. That is why it is measured per block rather than assumed.
+
 FINDING THE BLOCKS. The clusters can be read off the reference matrix instead
 of being named by hand: threshold the correlation matrix and take connected
 components (see :func:`auto_blocks`). On the in-situ efficiency fit that
@@ -140,15 +176,27 @@ PRECONDITION_SOURCES = ("hessian", "gaussnewton")
 class Block:
     """One factorised group of parameters: indices, L, and a cached L^-1."""
 
-    def __init__(self, idx, chol, cond_before=None, cond_after=None, label=""):
+    def __init__(
+        self,
+        idx,
+        chol,
+        cond_before=None,
+        cond_after=None,
+        label="",
+        corr_before=None,
+    ):
         self.idx = np.asarray(idx, dtype=np.int64)
         self.chol = np.asarray(chol, dtype=np.float64)
         if self.chol.shape != (self.idx.size,) * 2:
             raise ValueError(
                 f"chol shape {self.chol.shape} does not match block size {self.idx.size}"
             )
+        # cond_* are TRUE condition numbers, comparable at both ends.
+        # corr_before is the scale-free degeneracy of the incoming block; there
+        # is deliberately no corr_after (module docstring).
         self.cond_before = cond_before
         self.cond_after = cond_after
+        self.corr_before = corr_before
         self.label = label
         # Explicit L^-1, formed once so the per-call transform is a dense matvec
         # (parallel GEMV) instead of a triangular solve (inherently sequential).
@@ -274,6 +322,10 @@ class Preconditioner:
         # up to |lam_min| by a large negative eigenvalue. A summary that cannot
         # express that is worse than none, because it is read as success.
         #
+        # The arrow is the TRUE condition number at both ends, so it compares
+        # like with like; the scale-free degeneracy is a separate clause rather
+        # than the other end of an arrow. See WHAT THE NUMBERS MEAN.
+        #
         # Paired, so the two medians are guaranteed to be over the same set of
         # blocks. Both are set together on every success path, but filtering
         # them independently would not enforce that.
@@ -287,7 +339,7 @@ class Preconditioner:
             conds = [c for c, _ in pairs]
             conds_after = [c for _, c in pairs]
             summary += (
-                f"; correlation condition number median {np.median(conds):.3g}, "
+                f"; condition number median {np.median(conds):.3g}, "
                 f"worst {max(conds):.3g}"
                 f" -> median {np.median(conds_after):.3g}, "
                 f"worst {max(conds_after):.3g}"
@@ -295,6 +347,12 @@ class Preconditioner:
             if max(conds_after) > max(conds):
                 summary += " (WORSE than unpreconditioned)"
             summary += " at the reference point"
+            corrs = [b.corr_before for b in blocks if b.corr_before is not None]
+            if corrs:
+                summary += (
+                    f"; of which degeneracy (scale-free) median "
+                    f"{np.median(corrs):.3g}, worst {max(corrs):.3g}"
+                )
         if len(blocks) < n_req:
             summary += f" ({n_req - len(blocks)} block(s) not factorisable, skipped)"
         logger.info(summary)
@@ -329,21 +387,29 @@ class Preconditioner:
             )
             return None
 
-        cond_before = _cond_corr(block)
+        cond_before = _cond_true(block)
+        corr_before = _cond_corr(block)
 
         if transform == "ridge":
             return Preconditioner._factorise_ridge(
-                block, idx, cond_before, ridge, max_tries, label=label, names=names
+                block,
+                idx,
+                cond_before,
+                corr_before,
+                ridge,
+                max_tries,
+                label=label,
+                names=names,
             )
         if transform == "spectral":
             return Preconditioner._factorise_spectral(
-                block, idx, cond_before, label=label, names=names
+                block, idx, cond_before, corr_before, label=label, names=names
             )
         raise ValueError(f"unknown preconditioner transform {transform!r}")
 
     @staticmethod
     def _factorise_ridge(
-        block, idx, cond_before, ridge, max_tries, label="", names=None
+        block, idx, cond_before, corr_before, ridge, max_tries, label="", names=None
     ):
         """Ridge path: factorise ``B + eps*I``, escalating eps until it succeeds.
 
@@ -418,14 +484,17 @@ class Preconditioner:
             # Conditioning actually achieved: L^-1 B L^-T for the *un-ridged*
             # block B. Using the ridged matrix here would return 1 by
             # construction and measure nothing.
-            cond_after = _cond_corr(_whiten(chol, block))
+            cond_after = _cond_true(_whiten(chol, block))
             logger.debug(
                 f"Preconditioning {tag}block of {idx.size} parameters from the "
-                f"reference Hessian (ridge {eps:.3g} x max|diag|): correlation "
-                f"condition number {cond_before:.3g} -> {cond_after:.3g} at the "
-                f"reference point  [{_describe(idx, names)}]"
+                f"reference Hessian (ridge {eps:.3g} x max|diag|): condition "
+                f"number {cond_before:.3g} -> {cond_after:.3g}, of which "
+                f"degeneracy {corr_before:.3g}, at the reference point"
+                f"  [{_describe(idx, names)}]"
             )
-            return Block(idx, chol, cond_before, cond_after, label)
+            return Block(
+                idx, chol, cond_before, cond_after, label, corr_before=corr_before
+            )
 
         logger.warning(
             f"Preconditioning block {tag}is not factorisable; the largest ridge "
@@ -435,7 +504,7 @@ class Preconditioner:
         return None
 
     @staticmethod
-    def _factorise_spectral(block, idx, cond_before, label="", names=None):
+    def _factorise_spectral(block, idx, cond_before, corr_before, label="", names=None):
         """Spectral path: whiten by the Cholesky of ``|B| = Q |Lambda| Q^T``.
 
         Gives every eigendirection its own scale, so unlike the ridge it serves
@@ -532,16 +601,25 @@ class Preconditioner:
 
         # Conditioning actually achieved, on the UN-modified block: using |B|
         # here would return 1 by construction and measure nothing.
-        cond_after = _cond_corr(_whiten(chol, block))
+        #
+        # On this path the answer is 1 by a stronger argument, and it is worth
+        # knowing when reading the log: B and |B| share eigenvectors, so with
+        # |B| = L L^T the congruence L^-1 B L^-T sends Lambda to its own
+        # signature, i.e. tb is symmetric AND orthogonal (tb^2 = I) and true
+        # kappa is identically 1 at any block size. It is still measured rather
+        # than asserted, because n_floored > 0 breaks exactly that identity --
+        # a floored direction is one the congruence no longer preserves.
+        cond_after = _cond_true(_whiten(chol, block))
         n_neg = int(np.count_nonzero(w < 0.0))
         logger.debug(
             f"Preconditioning {tag}block of {idx.size} parameters by spectral "
             f"whitening of |H| (lam in [{w[0]:.3g}, {w[-1]:.3g}], {n_neg} "
-            f"negative, {n_floored} floored): correlation condition number "
-            f"{cond_before:.3g} -> {cond_after:.3g} at the reference point"
+            f"negative, {n_floored} floored): condition number "
+            f"{cond_before:.3g} -> {cond_after:.3g}, of which degeneracy "
+            f"{corr_before:.3g}, at the reference point"
             f"  [{_describe(idx, names)}]"
         )
-        return Block(idx, chol, cond_before, cond_after, label)
+        return Block(idx, chol, cond_before, cond_after, label, corr_before=corr_before)
 
     # -- the transform ---------------------------------------------------
 
@@ -653,12 +731,32 @@ def _whiten(chol, block):
     return scipy.linalg.solve_triangular(chol, t.T, lower=True, trans="N").T
 
 
+def _cond_true(mat):
+    """Condition number of ``mat`` itself: what the minimizer actually feels.
+
+    The Krylov inner solve converges in a number of Hessian-vector products
+    growing like sqrt of this, so it -- not the correlation number below -- is
+    the quantity a transform has to reduce. Reported for both ends of the
+    before/after pair, since after the transform the parameter scales are
+    precisely what was chosen rather than an arbitrary unit convention.
+    """
+    mat = np.asarray(mat, dtype=np.float64)
+    if mat.size == 0 or not np.all(np.isfinite(mat)):
+        return np.inf
+    try:
+        sv = np.linalg.svd(mat, compute_uv=False)
+    except np.linalg.LinAlgError:
+        return np.inf
+    return float(sv[0] / sv[-1]) if sv[-1] > 0 else np.inf
+
+
 def _cond_corr(mat):
     """Condition number of the *correlation* matrix of ``mat``.
 
     Scale-invariant, so it measures genuine degeneracy rather than a mismatch
-    of units between parameters -- the quantity that actually governs how hard
-    the block is to fit.
+    of units between parameters. Reported for the block as it arrives, where
+    the units genuinely are arbitrary; NOT for the whitened block, where it is
+    an artefact -- see WHAT THE NUMBERS MEAN in the module docstring.
     """
     d = np.sqrt(np.abs(np.diag(mat)))
     good = d > 0
