@@ -136,6 +136,41 @@ It is deliberately not reported for the whitened block, for two reasons:
   the congruence no longer preserves, so n_floored > 0 legitimately takes true
   kappa away from 1. That is why it is measured per block rather than assumed.
 
+NEVER MAKE IT WORSE. A block is dropped if it cannot be factorised, and also
+if whitening it would make its TRUE condition number worse by more than
+DEGRADE_TOLERANCE. The second half matters because succeeding badly is not
+obviously better than failing: whitening a block whose whole spectrum is
+negative needs a ridge of at least |lam_min| ~ max|diag|, which swamps every
+direction in it. Measured over 7094 such blocks across four off-diagonal
+strengths, the ridge degraded the true condition number in 100% of them, median
+10.8x, and improved none. Dropping restores exactly the unpreconditioned
+behaviour, so a fit can never come out worse on that block than with
+--precondition off.
+
+The guard keys off the true condition number, not the correlation one, which is
+blind to the clean case: a diagonal block has the identity as its correlation
+matrix both before and after, so diag(-7.5e3, -6.3e4, -2.1e3) reports 1 -> 1
+where the truth is 30 -> 320.
+
+It does not act on a block that is already singular to working precision
+(SINGULAR_COND). There the true condition number stops being a measurement --
+one rank-deficient block reads 5.28e+16 -> 7.32e+16, a 1.39x "degradation"
+between two values past 1/eps -- while the correlation number shows the ridge
+genuinely helping it, 3.1e+16 -> 1.4e+12. Ridging a rank-deficient block into
+shape is what the ridge was for in the first place, so that behaviour is left
+alone. It is the mirror image of the all-negative case, and the reason both
+metrics are kept rather than one being declared the right one.
+
+One consequence worth being plain about. Expressing the ridge in units of
+max|diag| rather than max(diag) means an all-negative block is now reachable at
+all -- it used to be rejected before any factorisation was attempted -- but
+since ridging such a block essentially never helps, the guard then drops it
+again. The net behaviour for those blocks is the same as before; what changed is
+that it is now arrived at by measurement, with a logged reason, rather than by a
+scale test that was mislabelled (it always said "max|diag|"), and that the same
+protection now covers every other block too. The spectral transform is what
+actually rescues them: it reaches 1 on the same block.
+
 FINDING THE BLOCKS. The clusters can be read off the reference matrix instead
 of being named by hand: threshold the correlation matrix and take connected
 components (see :func:`auto_blocks`). On the in-situ efficiency fit that
@@ -171,6 +206,20 @@ logger = logging.child_logger(__name__)
 
 # Sources for the reference matrix, built by the fitter (see Fitter._reference_matrix).
 PRECONDITION_SOURCES = ("hessian", "gaussnewton")
+
+# A block is dropped if whitening makes its true condition number worse by more
+# than this factor. Not zero, so that a tie or a rounding difference does not
+# churn a block in and out; small, because there is no reason to accept a
+# transform that measurably degrades what it was applied to. See
+# NEVER MAKE IT WORSE in the module docstring.
+DEGRADE_TOLERANCE = 0.01
+
+# Above this the block is singular to working precision and its condition
+# number is not a measurement any more, so the degradation guard does not act
+# on it: "worse" is not decidable between two values of order 1/eps, and
+# ridging a rank-deficient block into shape is the ridge's original purpose
+# (tests/test_preconditioner.py::test_rank_deficient_block_is_ridged_into_shape).
+SINGULAR_COND = 1.0 / np.finfo(np.float64).eps
 
 
 class Block:
@@ -391,7 +440,7 @@ class Preconditioner:
         corr_before = _cond_corr(block)
 
         if transform == "ridge":
-            return Preconditioner._factorise_ridge(
+            blk = Preconditioner._factorise_ridge(
                 block,
                 idx,
                 cond_before,
@@ -401,11 +450,54 @@ class Preconditioner:
                 label=label,
                 names=names,
             )
-        if transform == "spectral":
-            return Preconditioner._factorise_spectral(
+        elif transform == "spectral":
+            blk = Preconditioner._factorise_spectral(
                 block, idx, cond_before, corr_before, label=label, names=names
             )
-        raise ValueError(f"unknown preconditioner transform {transform!r}")
+        else:
+            raise ValueError(f"unknown preconditioner transform {transform!r}")
+
+        # NEVER MAKE IT WORSE. from_hessian already drops a block that cannot be
+        # factorised, on the principle that a preconditioner must never break a
+        # fit -- but that was applied only to factorisation FAILING, never to it
+        # succeeding and making things worse. Whitening a block whose whole
+        # spectrum is negative is exactly that case: the ridge has to be at
+        # least |lam_min| ~ max|diag|, so it swamps every direction in the
+        # block. Measured over 7094 such blocks across four off-diagonal
+        # strengths, the ridge degraded the true condition number in 100% of
+        # them, median 10.8x, and improved NONE.
+        #
+        # Dropping the block restores exactly the unpreconditioned behaviour
+        # there, so the fit can never come out worse than with --precondition
+        # off on that block, and the guard covers the pre-existing ridge path
+        # too rather than only the blocks the max|diag| fix newly reaches.
+        #
+        # It has to key off the TRUE condition number. The correlation number
+        # catches most of these but is blind to the clean case: a diagonal block
+        # has the identity as its correlation matrix both before and after, so
+        # diag(-7.5e3, -6.3e4, -2.1e3) reports 1 -> 1 while the truth is
+        # 30 -> 320. It is also why the guard must not run on corr_before.
+        # Not applied to an already-singular block: see SINGULAR_COND. There
+        # the true condition number is noise at the 1e16 level -- one such
+        # block measures 5.28e+16 -> 7.32e+16, a "degradation" of 1.39x between
+        # two numbers past 1/eps -- while the correlation number shows the ridge
+        # genuinely helping it (3.1e+16 -> 1.4e+12). That is the mirror image of
+        # the all-negative case above, and the reason the two metrics are both
+        # kept rather than one being declared correct.
+        if (
+            blk is not None
+            and blk.cond_before is not None
+            and blk.cond_after is not None
+            and blk.cond_before < SINGULAR_COND
+            and blk.cond_after > blk.cond_before * (1.0 + DEGRADE_TOLERANCE)
+        ):
+            logger.warning(
+                f"Preconditioning block {tag}would make the conditioning WORSE "
+                f"({blk.cond_before:.3g} -> {blk.cond_after:.3g}); leaving it "
+                f"unpreconditioned.  [{_describe(idx, names)}]"
+            )
+            return None
+        return blk
 
     @staticmethod
     def _factorise_ridge(

@@ -167,24 +167,84 @@ def test_near_null_direction_is_floored_not_amplified():
     assert blk.chol[0, 0] == pytest.approx(1.0)
 
 
-def test_ridge_can_start_on_an_all_negative_block():
-    """The DEFAULT path must not drop a block for having no positive diagonal.
+def test_all_negative_block_is_dropped_rather_than_made_worse():
+    """The ridge reaches these blocks now, and the guard then declines them.
 
-    The ridge is expressed in units of max|diag|; scaling it by max(diag)
-    instead skipped every all-negative block outright (21 of 34 on one real
-    fit). The first Cholesky still fails, then the spectrum branch sizes the
-    ridge from |lam_min| and it succeeds. Not as good as spectral -- 320
-    against 1 on this block -- but a usable transform beats none.
+    Expressing the ridge in units of max|diag| rather than max(diag) means an
+    all-negative block is no longer rejected before anything is attempted. But
+    such a block needs a ridge of at least |lam_min| ~ max|diag|, which swamps
+    every direction in it, so the result is WORSE than doing nothing -- 30 ->
+    320 here -- and NEVER MAKE IT WORSE drops it. Net behaviour matches the old
+    skip; the difference is that it is now measured and logged rather than
+    inferred from a mislabelled scale test.
     """
     neg = np.diag([-7.5e3, -6.3e4, -2.1e3]).astype(float)
-    blk = _factorise(neg, transform="ridge")
-    assert blk is not None
-    t = _whiten(blk.chol, neg)
-    assert _cond_true(t) < 1e3
-    assert np.all(np.diag(t) < 0)  # signs survive here too
+    assert _factorise(neg, transform="ridge") is None
 
-    spectral = _whiten(_factorise(neg, transform="spectral").chol, neg)
-    assert _cond_true(spectral) < _cond_true(t)
+    # the factorisation itself succeeds -- it is the guard that declines it,
+    # which is what makes this different from the old "no positive diagonal"
+    # rejection
+    raw = precond.Preconditioner._factorise_ridge(
+        neg, np.arange(3), _cond_true(neg), precond._cond_corr(neg), 1e-8, 4
+    )
+    assert raw is not None
+    assert _cond_true(_whiten(raw.chol, neg)) > _cond_true(neg)
+
+    # and the correlation number cannot see it: a diagonal block has the
+    # identity as its correlation matrix at both ends
+    assert precond._cond_corr(neg) == pytest.approx(1.0)
+    assert precond._cond_corr(_whiten(raw.chol, neg)) == pytest.approx(1.0)
+
+    # spectral is what actually rescues the block
+    spec = _factorise(neg, transform="spectral")
+    assert spec is not None
+    assert _cond_true(_whiten(spec.chol, neg)) == pytest.approx(1.0, rel=1e-6)
+
+
+def test_guard_keeps_a_block_the_transform_genuinely_helps():
+    """The guard must not be a blanket refusal -- but which blocks each
+    transform helps is not the same set, which is the whole argument of this PR.
+
+    A positive-definite ill-conditioned block is the ridge's home ground and it
+    is kept. A random INDEFINITE block is not: the ridge degrades it (34 -> 388
+    here) and is declined, while spectral takes it to 1. That asymmetry is the
+    case for the spectral transform, stated as a test rather than as prose.
+    """
+    rng = np.random.default_rng(3)
+    q, _ = np.linalg.qr(rng.standard_normal((12, 12)))
+    pd = q @ np.diag(np.geomspace(1.0, 1e6, 12)) @ q.T
+    for transform in ("ridge", "spectral"):
+        blk = _factorise(pd, transform=transform)
+        assert blk is not None, f"{transform} dropped a PD block it improves"
+        assert blk.cond_after < blk.cond_before
+
+    a = rng.standard_normal((12, 12))
+    indef = a + a.T
+    assert _factorise(indef, transform="ridge") is None  # declined by the guard
+    spec = _factorise(indef, transform="spectral")
+    assert spec is not None
+    assert spec.cond_after == pytest.approx(1.0, rel=1e-6)
+
+
+def test_guard_does_not_act_on_an_already_singular_block():
+    """Ridging a rank-deficient block into shape is the ridge's original job.
+
+    Its true condition number is ~1/eps at both ends, so a ratio between them
+    is noise rather than a measurement -- and the correlation number shows the
+    ridge genuinely helping. So the guard stands down above SINGULAR_COND.
+    """
+    rng = np.random.default_rng(9)
+    q, _ = np.linalg.qr(rng.standard_normal((5, 5)))
+    h = q @ np.diag(np.geomspace(1.0, 1e6, 5)) @ q.T
+    h[:, -1] = h[:, 0]  # exact linear dependence
+    h[-1, :] = h[0, :]
+    h = 0.5 * (h + h.T)
+
+    assert _cond_true(h) > precond.SINGULAR_COND
+    blk = _factorise(h, transform="ridge")
+    assert blk is not None, "an already-singular block must still be ridged"
+    tb = _whiten(blk.chol, h)
+    assert precond._cond_corr(tb) < precond._cond_corr(h)  # what did improve
 
 
 def test_default_transform_is_ridge_so_existing_behaviour_is_unchanged():
