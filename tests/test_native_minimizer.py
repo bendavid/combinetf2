@@ -236,13 +236,14 @@ def test_callback_and_early_stopping():
 # --- 3. full fit through the Fitter ---------------------------------------
 
 
-def run_fit_native(filename, method="tf-trust-exact", precondition=False):
+def run_fit_native(filename, method="tf-trust-exact", precondition=False, **extra):
     indata_obj = inputdata.FitInputData(filename)
     param_model = load_model("Mu", indata_obj)
 
     kwargs = dict(minimizerMethod=method)
     if precondition:
         kwargs.update(precondition=True, preconditionParams=[".*"])
+    kwargs.update(extra)
     options = make_options(**kwargs)
     f = fitter.Fitter(indata_obj, param_model, options)
     f.set_nobs(indata_obj.data_obs)
@@ -260,21 +261,60 @@ def run_fit_native(filename, method="tf-trust-exact", precondition=False):
     }
 
 
+def test_unconsumed_minimizer_option_warns(caplog):
+    """--minimizerFtol reaches the native methods and none of them read it.
+
+    scipy raises an OptimizeWarning for an option its solver does not know;
+    without this the option was echoed in the [minimize] line and then
+    silently dropped, so the user got no signal either way.
+    """
+    import logging
+
+    from rabbit.fitter import NATIVE_MINIMIZER_OPTIONS
+
+    assert "ftol" not in NATIVE_MINIMIZER_OPTIONS["tf-trust-exact"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = make_test_tensor(tmpdir)
+        with caplog.at_level(logging.WARNING):
+            run_fit_native(fname, "tf-trust-exact", False, minimizerFtol=1e-8)
+        assert any(
+            "does not implement ftol" in r.message and "--minimizerFtol" in r.message
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+        # and no warning when the option was not given
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            run_fit_native(fname, "tf-trust-exact", False)
+        assert not any("does not implement" in r.message for r in caplog.records)
+
+
+@pytest.fixture(scope="module")
+def scipy_reference():
+    """The tensor and the scipy trust-krylov fit of it, built once.
+
+    Both are independent of the parametrization below, so building them per
+    case ran six identical reference fits (~3.2 s each) where one suffices.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = make_test_tensor(tmpdir)
+        yield fname, run_fit(fname)  # trust-krylov: same likelihood, same minimum
+
+
 @pytest.mark.parametrize(
     "method", ["tf-trust-exact", "tf-trust-ncg", "tf-trust-krylov"]
 )
 @pytest.mark.parametrize("precondition", [False, True])
-def test_fit_matches_scipy(method, precondition):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname = make_test_tensor(tmpdir)
+def test_fit_matches_scipy(method, precondition, scipy_reference):
+    fname, res_ref = scipy_reference
 
-        res_native = run_fit_native(fname, method, precondition)
-        res_ref = run_fit(fname)  # trust-krylov: same likelihood, same minimum
+    res_native = run_fit_native(fname, method, precondition)
 
-        x_ref = np.concatenate([res_ref["param"], res_ref["theta"]])
-        np.testing.assert_allclose(res_native["x"], x_ref, atol=1e-5, rtol=1e-4)
-        assert res_native["edmval"] < 1e-4
-        assert res_native["status"]["nit"] > 0
+    x_ref = np.concatenate([res_ref["param"], res_ref["theta"]])
+    np.testing.assert_allclose(res_native["x"], x_ref, atol=1e-5, rtol=1e-4)
+    assert res_native["edmval"] < 1e-4
+    assert res_native["status"]["nit"] > 0
 
 
 # --- 4. Steihaug-CG (tf-trust-ncg) ----------------------------------------

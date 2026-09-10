@@ -67,6 +67,16 @@ def match_regexp_params(regular_expressions, parameter_names):
     return matched
 
 
+# Options from --minimizerMaxiter/--minimizerGtol/--minimizerFtol that each
+# native minimizer actually reads. Anything else passed for these methods is
+# warned about rather than silently dropped (see Fitter.fit).
+NATIVE_MINIMIZER_OPTIONS = {
+    "tf-trust-exact": {"gtol", "maxiter"},
+    "tf-trust-ncg": {"gtol", "maxiter"},
+    "tf-trust-krylov": {"gtol", "maxiter"},
+}
+
+
 class Fitter:
     valid_systematic_types = ["log_normal", "normal"]
 
@@ -2477,6 +2487,24 @@ class Fitter:
         if self.minimizer_ftol is not None:
             sci_opts["ftol"] = float(self.minimizer_ftol)
         logger.info(f"[minimize] method={self.minimizer_method} options={sci_opts}")
+
+        # The native minimizers take gtol and maxiter and nothing else, so any
+        # other key here is silently dropped -- scipy at least raises an
+        # OptimizeWarning for an option its method does not recognize, and
+        # without this the user sees the option echoed in the line above and
+        # then has no signal that it did nothing. --minimizerFtol is the one
+        # that reaches this today.
+        if self.minimizer_method in NATIVE_MINIMIZER_OPTIONS:
+            ignored = sorted(
+                set(sci_opts) - NATIVE_MINIMIZER_OPTIONS[self.minimizer_method]
+            )
+            if ignored:
+                logger.warning(
+                    f"{self.minimizer_method} does not implement "
+                    f"{', '.join(ignored)}; ignoring "
+                    f"{', '.join(f'--minimizer{o.capitalize()}' for o in ignored)}. "
+                    "Use a scipy --minimizerMethod if you need it."
+                )
 
         # Restart loop. scipy's trust-region methods shrink the trust radius by
         # 4x on every rejected step with no lower bound, and the radius is a
