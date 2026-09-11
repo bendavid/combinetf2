@@ -294,7 +294,10 @@ def common_parser():
         "'expressions' makes one block per --preconditionParams entry. 'none' does "
         "no grouping at all and factorises the whole selected scope as a single "
         "block, which keeps every cross-correlation but is the most expensive and "
-        "fails entirely if any part of the scope is singular.",
+        "fails entirely if any part of the scope is singular. What blocking is "
+        "FOR depends on --preconditionTransform (under 'ridge' it is a "
+        "correctness tool, under 'spectral' only a cost limit): see CHOOSING "
+        "THE OPTIONS in rabbit/preconditioner.py.",
     )
     parser.add_argument(
         "--preconditionBlockThreshold",
@@ -303,7 +306,9 @@ def common_parser():
         help="Correlation threshold for --preconditionBlocks auto. Correlations "
         "below it are left unpreconditioned. Too low and every parameter "
         "percolates into a single block; too high and genuinely coupled "
-        "parameters are split apart.",
+        "parameters are split apart. Only used by --preconditionBlocks auto, "
+        "and under --preconditionTransform spectral it works against you: see "
+        "CHOOSING THE OPTIONS in rabbit/preconditioner.py.",
     )
     parser.add_argument(
         "--preconditionFrom",
@@ -318,7 +323,9 @@ def common_parser():
         "exact Hessian is indefinite at the starting point, whitening with it leaves "
         "those directions negative and the fit stalls, so 'hessian' is usually the "
         "better choice; prefer 'gaussnewton' only where the Hessian is positive "
-        "definite anyway, e.g. near a minimum.",
+        "definite anyway, e.g. near a minimum. Under --preconditionTransform "
+        "spectral there is no reason to choose 'gaussnewton' at all: see "
+        "CHOOSING THE OPTIONS in rabbit/preconditioner.py.",
     )
     parser.add_argument(
         "--preconditionRidge",
@@ -327,7 +334,26 @@ def common_parser():
         help="Ridge added to the preconditioning block diagonal, relative to its largest "
         "diagonal entry, to keep near-degenerate blocks factorisable. Escalated "
         "automatically if the Cholesky still fails; a block that cannot be factorised "
-        "falls back to no preconditioning.",
+        "falls back to no preconditioning. Applies to "
+        "--preconditionTransform ridge only; spectral derives its floor from "
+        "the numerical rank of the block instead.",
+    )
+    parser.add_argument(
+        "--preconditionTransform",
+        default="ridge",
+        type=str,
+        choices=["ridge", "spectral"],
+        help="How to whiten each block. 'ridge' (the default) factorises "
+        "H + eps*I, raising eps until the Cholesky succeeds. 'spectral' "
+        "factorises |H| = Q |Lambda| Q^T instead, giving every eigendirection "
+        "its own scale. They agree exactly on a positive definite block -- both "
+        "return the identity -- and differ where H is indefinite, which away "
+        "from the minimum it generally is: one scalar ridge swamps every "
+        "direction softer than |lam_min| and leaves them near-null, where "
+        "spectral does not. Costs an eigendecomposition rather than a Cholesky, "
+        "~1.7 s once per build at m=2112. For the measurements, and for how "
+        "this interacts with the other --precondition* options, see WHITENING "
+        "EACH BLOCK in rabbit/preconditioner.py.",
     )
     parser.add_argument(
         "--snapshotFile",
