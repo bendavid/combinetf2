@@ -86,6 +86,7 @@ jobs:
           BIN="$RUNNER_TEMP/bin"
           mkdir -p "$BIN"
           echo "$BIN" >> "$GITHUB_PATH"
+          export PATH="$BIN:$PATH"
           fetch() { # url sha256 -> extracts tarball into $RUNNER_TEMP
             tmp="$(mktemp)"
             curl -fsSL "$1" -o "$tmp"
