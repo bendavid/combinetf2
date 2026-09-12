@@ -58,6 +58,11 @@ jobs:
     steps:
       - name: Check out this repository (patch source)
         uses: actions/checkout@v4
+        with:
+          # hodor reuses this checkout as its review workspace and diffs
+          # against origin/<base>; depth 1 leaves no origin/main ref and
+          # silently degrades reviews to command mode.
+          fetch-depth: 0
 
       - name: Preflight configuration
         run: |
