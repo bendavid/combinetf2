@@ -139,5 +139,6 @@ jobs:
           bun run "$RUNNER_TEMP/hodor-src/dist/cli.js" \
             "https://github.com/${{ github.repository }}/pull/$PR" \
             --model "openrouter/$HODOR_MODEL" \
+            --reasoning-effort max \
             --post \
             --require-delivery
