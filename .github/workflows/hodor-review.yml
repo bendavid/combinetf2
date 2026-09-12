@@ -1,0 +1,100 @@
+name: Hodor AI review
+
+# Automated PR code review with hodor (https://github.com/mr-karan/hodor),
+# driven by a self-hosted OpenAI-compatible endpoint (CERN AI gateway).
+#
+# hodor has no native custom-endpoint support: its OpenAI-compatible fallback
+# model is hardwired to openrouter.ai. We therefore clone hodor at a pinned
+# tag, apply .github/hodor/llm-base-url.patch (honors LLM_BASE_URL and pins
+# the client to plain OpenAI chat-completions semantics), and build it here.
+#
+# Required configuration (organization or repository level):
+#   secret   HODOR_LLM_API_KEY   API key for the endpoint. An *organization*
+#                                secret is recommended so the same key can be
+#                                shared by every repo running this workflow
+#                                (set visibility to the selected repos).
+#   variable HODOR_LLM_BASE_URL  Optional override for the endpoint base URL.
+#
+# Token/key hygiene: the job is guarded to never run for fork PRs via the
+# pull_request trigger (GitHub withholds secrets there anyway). For a fork PR,
+# a maintainer can vet the change and start a review manually:
+#   Actions -> Hodor AI review -> Run workflow -> PR number
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
+
+concurrency:
+  group: hodor-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Fork PRs on the pull_request trigger get no secrets; skip them.
+    # Skip drafts; reviews start when the PR is marked ready.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       !github.event.pull_request.draft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write # review comments on the PR
+      issues: write # PR comments are issue comments via the API
+    env:
+      HODOR_VERSION: v0.7.7
+      LLM_BASE_URL: ${{ vars.HODOR_LLM_BASE_URL || 'https://aigw.cern.ch/v1' }}
+      HODOR_MODEL: ${{ vars.HODOR_LLM_MODEL || 'Kimi-K3-FLATIRON' }}
+      LLM_API_KEY: ${{ secrets.HODOR_LLM_API_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PI_OFFLINE: "1" # never download rg/fd binaries mid-review
+    steps:
+      - name: Check out this repository (patch source)
+        uses: actions/checkout@v4
+
+      - name: Preflight configuration
+        run: |
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "::error::HODOR_LLM_API_KEY secret is not configured. Add it as an organization or repository secret."
+            exit 1
+          fi
+
+      - name: Install review tool dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ripgrep fd-find
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: hodor-${{ env.HODOR_VERSION }}-${{ hashFiles('.github/hodor/llm-base-url.patch') }}
+          restore-keys: hodor-
+
+      - name: Build patched hodor
+        run: |
+          git clone --depth 1 --branch "$HODOR_VERSION" https://github.com/mr-karan/hodor.git hodor-src
+          git -C hodor-src apply ../.github/hodor/llm-base-url.patch
+          cd hodor-src
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Run hodor review
+        run: |
+          PR="${{ github.event.pull_request.number || inputs.pr_number }}"
+          bun run hodor-src/dist/cli.js \
+            "https://github.com/${{ github.repository }}/pull/$PR" \
+            --model "openrouter/$HODOR_MODEL" \
+            --post \
+            --require-delivery

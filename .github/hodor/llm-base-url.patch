@@ -1,0 +1,50 @@
+diff --git a/src/agent.ts b/src/agent.ts
+index 7c4f013..99b3102 100644
+--- a/src/agent.ts
++++ b/src/agent.ts
+@@ -236,17 +236,44 @@ export async function reviewPr(opts: {
+         `Regional bedrock model, region: ${region}, capabilities from ${baseModel.id}`,
+       );
+     } else if (parsed.provider === "openrouter") {
++      // LLM_BASE_URL redirects the OpenAI-compatible fallback to a
++      // self-hosted endpoint (LiteLLM/vLLM gateway, ...). Compat is pinned to
++      // plain OpenAI chat-completions semantics so no OpenRouter-specific
++      // parameter shapes (`reasoning: { effort }`) are sent upstream.
++      // pi-coding-agent defaults reasoning models to effort "medium"; the
++      // thinkingLevelMap below remaps pi levels onto values the endpoint
++      // accepts (Kimi K3 on vLLM: low/high/max only).
++      const customBaseUrl = process.env.LLM_BASE_URL?.trim();
+       piModel = {
+         id: parsed.modelId,
+         name: parsed.modelId,
+         api: "openai-completions",
+         provider: "openrouter",
+-        baseUrl: "https://openrouter.ai/api/v1",
++        baseUrl: customBaseUrl ?? "https://openrouter.ai/api/v1",
+         reasoning: true,
+         input: ["text", "image"] as ("text" | "image")[],
+         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+         contextWindow: 256000,
+         maxTokens: 65536,
++        ...(customBaseUrl
++          ? {
++              compat: {
++                supportsStore: false,
++                supportsDeveloperRole: false,
++                supportsReasoningEffort: true,
++                thinkingFormat: "openai",
++                maxTokensField: "max_completion_tokens",
++              },
++              thinkingLevelMap: {
++                minimal: "low",
++                low: "low",
++                medium: "high",
++                high: "high",
++                xhigh: "max",
++                max: "max",
++              },
++            }
++          : {}),
+       } as Model<Api>;
+       logger.warn(`Using best-effort unregistered OpenRouter model — ${parsed.modelId}`);
+     } else {
