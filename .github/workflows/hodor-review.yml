@@ -1,12 +1,18 @@
 name: Hodor AI review
 
 # Automated PR code review with hodor (https://github.com/mr-karan/hodor),
-# driven by a self-hosted OpenAI-compatible endpoint (CERN AI gateway).
+# driven by the CERN AI gateway (aigw.cern.ch) serving Kimi K3.
+#
+# aigw.cern.ch is firewalled to the CERN network, so this job MUST run on
+# the repository's CERN-based self-hosted runners; GitHub-hosted runners
+# cannot reach the endpoint (verified: TCP connect blackholed).
 #
 # hodor has no native custom-endpoint support: its OpenAI-compatible fallback
-# model is hardwired to openrouter.ai. We therefore clone hodor at a pinned
-# tag, apply .github/hodor/llm-base-url.patch (honors LLM_BASE_URL and pins
-# the client to plain OpenAI chat-completions semantics), and build it here.
+# model is hardwired to openrouter.ai (its documented LLM_BASE_URL is a stale
+# pre-rewrite artifact). We therefore clone hodor at a pinned tag, apply
+# .github/hodor/llm-base-url.patch (honors LLM_BASE_URL, pins plain OpenAI
+# chat-completions semantics, and remaps reasoning efforts medium/xhigh that
+# the endpoint's chat template rejects), and build it here.
 #
 # Required configuration (organization or repository level):
 #   secret   HODOR_LLM_API_KEY   API key for the endpoint. An *organization*
@@ -42,7 +48,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
        !github.event.pull_request.draft)
-    runs-on: ubuntu-latest
+    # CERN-network self-hosted runners only (see header comment).
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -71,36 +78,39 @@ jobs:
             exit 1
           fi
 
-      - name: Install review tool dependencies
+      - name: Ensure review tools (gh, rg, fd)
+        # Self-hosted runner image has no guaranteed gh/rg/fd and no sudo;
+        # fall back to pinned static builds in a job-local bin dir.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ripgrep fd-find
-          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
-
-      - name: Diagnose aigw connectivity (temporary)
-        continue-on-error: true
-        run: |
-          T='dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} firstbyte=%{time_starttransfer} total=%{time_total} http=%{http_code}\n'
-          echo "=== A: baseline, small non-stream, low effort ==="
-          timeout 60 curl -sS https://aigw.cern.ch/v1/chat/completions \
-            -H "Authorization: Bearer $LLM_API_KEY" -H "Content-Type: application/json" \
-            -d '{"model":"Kimi-K3-FLATIRON","messages":[{"role":"user","content":"Say OK"}],"max_completion_tokens":16,"reasoning_effort":"low"}' \
-            -o /tmp/a.json -w "$T" && head -c 200 /tmp/a.json
-          echo "=== B: streamed, high effort, long generation ==="
-          timeout 400 curl -sSN https://aigw.cern.ch/v1/chat/completions \
-            -H "Authorization: Bearer $LLM_API_KEY" -H "Content-Type: application/json" \
-            -d '{"model":"Kimi-K3-FLATIRON","messages":[{"role":"user","content":"Think carefully, then list the first 40 prime numbers with a one-line comment about each."}],"max_completion_tokens":65536,"reasoning_effort":"high","stream":true}' \
-            -o /tmp/b.sse -w "$T" ; echo "chunks=$(grep -c '^data:' /tmp/b.sse)"; head -c 200 /tmp/b.sse
-          echo "=== C: streamed, high effort, hodor-sized prompt (~200KB) ==="
-          CTX="$(for i in $(seq 30); do cat .github/hodor/llm-base-url.patch .github/workflows/hodor-review.yml; done)"
-          SYS="$(printf 'You are a code review agent. Follow the review protocol exactly.\n%.0s' $(seq 200))"
-          jq -n --arg sys "$SYS" --arg ctx "$CTX" \
-            '{model:"Kimi-K3-FLATIRON", messages:[{role:"system",content:$sys},{role:"user",content:("Background context:\n" + $ctx + "\n\nThink step by step, then reply with exactly: DONE")}], max_completion_tokens:65536, reasoning_effort:"high", stream:true}' \
-            > /tmp/c-payload.json
-          timeout 400 curl -sSN https://aigw.cern.ch/v1/chat/completions \
-            -H "Authorization: Bearer $LLM_API_KEY" -H "Content-Type: application/json" \
-            -d @/tmp/c-payload.json \
-            -o /tmp/c.sse -w "$T" ; echo "chunks=$(grep -c '^data:' /tmp/c.sse)"; head -c 200 /tmp/c.sse
+          set -e
+          BIN="$RUNNER_TEMP/bin"
+          mkdir -p "$BIN"
+          echo "$BIN" >> "$GITHUB_PATH"
+          fetch() { # url sha256 -> extracts tarball into $RUNNER_TEMP
+            tmp="$(mktemp)"
+            curl -fsSL "$1" -o "$tmp"
+            echo "$2  $tmp" | sha256sum -c -
+            tar -xzf "$tmp" -C "$RUNNER_TEMP"
+            rm -f "$tmp"
+          }
+          command -v gh >/dev/null || {
+            fetch https://github.com/cli/cli/releases/download/v2.83.0/gh_2.83.0_linux_amd64.tar.gz \
+                  a5cf6cdb40fc67751adf561126b3314044779cea81ba4f254fbe8e9a69f1676f
+            cp "$RUNNER_TEMP/gh_2.83.0_linux_amd64/bin/gh" "$BIN/"
+          }
+          command -v rg >/dev/null || {
+            fetch https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz \
+                  1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+            cp "$RUNNER_TEMP/ripgrep-15.1.0-x86_64-unknown-linux-musl/rg" "$BIN/"
+          }
+          command -v fd >/dev/null || {
+            fetch https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-x86_64-unknown-linux-musl.tar.gz \
+                  761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7
+            cp "$RUNNER_TEMP/fd-v10.5.0-x86_64-unknown-linux-musl/fd" "$BIN/"
+          }
+          gh --version
+          rg --version | head -1
+          fd --version
 
       - name: Set up bun
         uses: oven-sh/setup-bun@v2
@@ -114,16 +124,18 @@ jobs:
 
       - name: Build patched hodor
         run: |
-          git clone --depth 1 --branch "$HODOR_VERSION" https://github.com/mr-karan/hodor.git hodor-src
-          git -C hodor-src apply ../.github/hodor/llm-base-url.patch
-          cd hodor-src
+          set -e
+          HODOR_SRC="$RUNNER_TEMP/hodor-src"
+          git clone --depth 1 --branch "$HODOR_VERSION" https://github.com/mr-karan/hodor.git "$HODOR_SRC"
+          git -C "$HODOR_SRC" apply "$GITHUB_WORKSPACE/.github/hodor/llm-base-url.patch"
+          cd "$HODOR_SRC"
           bun install --frozen-lockfile
           bun run build
 
       - name: Run hodor review
         run: |
           PR="${{ github.event.pull_request.number || inputs.pr_number }}"
-          bun run hodor-src/dist/cli.js \
+          bun run "$RUNNER_TEMP/hodor-src/dist/cli.js" \
             "https://github.com/${{ github.repository }}/pull/$PR" \
             --model "openrouter/$HODOR_MODEL" \
             --post \
